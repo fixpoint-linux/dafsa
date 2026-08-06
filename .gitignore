@@ -1,0 +1,11 @@
+# Build artifacts
+dafsa
+dafsa.dot
+dawg
+
+# Compiled outputs
+*.elf
+*.dbg
+
+# Python site packages
+.py-site/
