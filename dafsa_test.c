@@ -14,6 +14,14 @@
 #include <string.h>
 #include <assert.h>
 
+/* ─── M1 test parameters ─────────────────────────────────────────────── */
+#define RT_TRIALS    10    /* round-trip trials */
+#define RT_KEYS    1200    /* random keys per round-trip trial */
+#define RT_MAXLEN     8
+#define DD_TRIALS    60    /* delete-differential trials */
+#define DD_UNIVERSE 200    /* universe words per differential trial */
+#define DD_MAXLEN     8
+
 /* ─── Helper: print stats from a dafsa_stats_out ───────────────────── */
 
 static void print_stats(const dafsa_stats_out *st)
@@ -31,6 +39,59 @@ static void show_stats(const dafsa *d)
     dafsa_stats_out st;
     dafsa_stats(d, &st);
     print_stats(&st);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* ─── M1 test helpers ─────────────────────────────────────────────────── */
+
+static uint32_t g_rng = 0x2F6E2B1u;
+
+static uint32_t rng_next(void)
+{
+    g_rng = g_rng * 1664525u + 1013904223u;   /* LCG, deterministic */
+    return g_rng;
+}
+
+static const char rng_alphabet[] = "abcdefghijklmnopqrstuvwxyz";
+
+/* Assert DAFSA lookup matches the reference set for every universe word. */
+static void check_parity(dafsa *d, const unsigned char (*keys)[16],
+                         const size_t *lens, const int *in_set, int n)
+{
+    int k;
+    for (k = 0; k < n; k++) {
+        int got = dafsa_lookup_n(d, keys[k], lens[k]);
+        assert(got == in_set[k]);
+    }
+}
+
+typedef struct {
+    unsigned char payloads[64][8];
+    size_t plen[64];
+    int count;
+    int stop_after;   /* >0: cb returns non-zero once count reaches it */
+} enum_ctx;
+
+static int enum_collect(const unsigned char *payload, size_t payload_len,
+                        void *user)
+{
+    enum_ctx *c = (enum_ctx *)user;
+    if (c->count < 64) {
+        size_t n = payload_len < 8 ? payload_len : 8;
+        memcpy(c->payloads[c->count], payload, n);
+        c->plen[c->count] = payload_len;
+    }
+    c->count++;
+    if (c->stop_after > 0 && c->count >= c->stop_after) return 1;
+    return 0;
+}
+
+static int word_in_set(const char *w, const char *const *set, int n)
+{
+    int i;
+    for (i = 0; i < n; i++)
+        if (strcmp(w, set[i]) == 0) return 1;
+    return 0;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════ */
@@ -329,6 +390,257 @@ int main(void)
         dafsa_free(dn);
     }
     printf("  PASS: embedded NUL keys work with _n, invisible to strlen wrappers\n");
+
+    /* ── Test 11: Round-trip persistence ── */
+    printf("\n[M1 Test 11] Round-trip: add %d random keys -> save -> free -> load\n",
+           RT_KEYS);
+    {
+        static const char alphabet[] = "abcdefghijklmnopqrstuvwxyz";
+        int trial;
+        g_rng = 0x0C0FFEE11u;
+        for (trial = 0; trial < RT_TRIALS; trial++) {
+            unsigned char (*keys)[16] = malloc(RT_KEYS * sizeof(*keys));
+            size_t lens[RT_KEYS];
+            dafsa *d, *d2;
+            dafsa_stats_out st1, st2;
+            char path[256];
+            int k;
+
+            assert(keys != NULL);
+            snprintf(path, sizeof(path), "/tmp/m1_rt_%d.pdwg", trial);
+
+            /* generate random keys */
+            for (k = 0; k < RT_KEYS; k++) {
+                size_t len = 1 + rng_next() % RT_MAXLEN;
+                size_t j;
+                lens[k] = len;
+                for (j = 0; j < len; j++)
+                    keys[k][j] =
+                        (unsigned char)alphabet[rng_next() % (sizeof(alphabet) - 1)];
+            }
+
+            d = dafsa_create();
+            assert(d != NULL);
+            for (k = 0; k < RT_KEYS; k++)
+                dafsa_add_n(d, keys[k], lens[k]);
+
+            dafsa_stats(d, &st1);
+            assert(dafsa_save(d, path) == 0);
+            dafsa_free(d);
+
+            d2 = dafsa_load(path);
+            assert(d2 != NULL);
+            for (k = 0; k < RT_KEYS; k++)
+                assert(dafsa_lookup_n(d2, keys[k], lens[k]) == 1);
+
+            dafsa_stats(d2, &st2);
+            assert(st2.n_states_reachable == st1.n_states_reachable);
+            assert(st2.n_final == st1.n_final);
+            assert(st2.n_trans == st1.n_trans);
+
+            dafsa_free(d2);
+            remove(path);
+            free(keys);
+            printf("  trial %d: %d keys, %u reachable, %u final OK\n",
+                   trial, RT_KEYS, st1.n_states_reachable, st1.n_final);
+        }
+    }
+    printf("  PASS: round-trip preserves lookup set and reachable-state count\n");
+
+    /* ── Test 12: Randomized delete differential ── */
+    printf("\n[M1 Test 12] Randomized delete differential (%d trials)\n", DD_TRIALS);
+    {
+        unsigned char (*univ)[16] = malloc(DD_UNIVERSE * sizeof(*univ));
+        size_t ulens[DD_UNIVERSE];
+        int in_set[DD_UNIVERSE];
+        int trial, k;
+
+        assert(univ != NULL);
+        g_rng = 0x0DD0D202u;
+
+        /* generate a unique word universe */
+        for (k = 0; k < DD_UNIVERSE; k++) {
+            int dup;
+            size_t len, j;
+            do {
+                len = 1 + rng_next() % DD_MAXLEN;
+                for (j = 0; j < len; j++)
+                    univ[k][j] = (unsigned char)
+                        rng_alphabet[rng_next() % (sizeof(rng_alphabet) - 1)];
+                dup = 0;
+                {
+                    int m;
+                    for (m = 0; m < k; m++) {
+                        if (ulens[m] == len &&
+                            memcmp(univ[m], univ[k], len) == 0) {
+                            dup = 1;
+                            break;
+                        }
+                    }
+                }
+            } while (dup);
+            ulens[k] = len;
+        }
+
+        for (trial = 0; trial < DD_TRIALS; trial++) {
+            dafsa *d = dafsa_create();
+            assert(d != NULL);
+            for (k = 0; k < DD_UNIVERSE; k++) {
+                dafsa_add_n(d, univ[k], ulens[k]);
+                in_set[k] = 1;
+            }
+
+            /* save/load round-trip in a few trials */
+            if (trial == 3 || trial == 27 || trial == 45) {
+                char path[64];
+                snprintf(path, sizeof(path), "/tmp/m1_dd_%d.pdwg", trial);
+                assert(dafsa_save(d, path) == 0);
+                dafsa_free(d);
+                d = dafsa_load(path);
+                assert(d != NULL);
+                check_parity(d, univ, ulens, in_set, DD_UNIVERSE);
+                remove(path);
+            }
+
+            /* delete a random subset */
+            for (k = 0; k < DD_UNIVERSE; k++) {
+                if (in_set[k] && rng_next() % 4 == 0) {
+                    assert(dafsa_delete_n(d, univ[k], ulens[k]) == 1);
+                    in_set[k] = 0;
+                }
+            }
+            check_parity(d, univ, ulens, in_set, DD_UNIVERSE);
+
+            /* re-add a random subset of the deleted */
+            for (k = 0; k < DD_UNIVERSE; k++) {
+                if (!in_set[k] && rng_next() % 2 == 0) {
+                    assert(dafsa_add_n(d, univ[k], ulens[k]) == 1);
+                    in_set[k] = 1;
+                }
+            }
+            check_parity(d, univ, ulens, in_set, DD_UNIVERSE);
+
+            dafsa_free(d);
+        }
+        free(univ);
+    }
+    printf("  PASS: %d delete-differential trials\n", DD_TRIALS);
+
+    /* ── Test 13: Prefix enumeration (W\0 semantics) ── */
+    printf("\n[M1 Test 13] Prefix enumeration (W\\0 semantics)\n");
+    {
+        const char *words[] = {"cat", "car", "cart", "dog",
+                               "do",  "apple", "app", "apt"};
+        const int nwords = 8;
+        const unsigned char pload[] = {1, 2, 3, 4, 5, 6, 7, 8};
+        unsigned char key[64];
+        dafsa *dp = dafsa_create();
+        int i;
+        int total = 0;
+
+        assert(dp != NULL);
+        /* keys = word || 0x00 || payload-byte */
+        for (i = 0; i < nwords; i++) {
+            size_t wlen = strlen(words[i]);
+            memcpy(key, words[i], wlen);
+            key[wlen] = 0x00;
+            key[wlen + 1] = pload[i];
+            assert(dafsa_add_n(dp, key, wlen + 2) == 1);
+        }
+
+        /* explicit W\0 checks */
+        {
+            enum_ctx c;
+            long n;
+
+            memset(&c, 0, sizeof(c));
+            n = dafsa_prefix_enum(dp, (const unsigned char *)"ca", 2,
+                                  enum_collect, &c);
+            assert(n == 0 && c.count == 0);   /* "ca" must NOT match cat/car/cart */
+            total++;
+
+            memset(&c, 0, sizeof(c));
+            n = dafsa_prefix_enum(dp, (const unsigned char *)"cat", 3,
+                                  enum_collect, &c);
+            assert(n == 1 && c.count == 1);
+            assert(c.plen[0] == 1 && c.payloads[0][0] == 1);  /* cat payload */
+            total++;
+
+            memset(&c, 0, sizeof(c));
+            n = dafsa_prefix_enum(dp, (const unsigned char *)"cart", 4,
+                                  enum_collect, &c);
+            assert(n == 1 && c.count == 1);
+            assert(c.plen[0] == 1 && c.payloads[0][0] == 3);  /* cart payload */
+            total++;
+        }
+
+        /* random prefixes vs brute force (a prefix yields hits iff it is a word) */
+        {
+            int p;
+            for (p = 0; p < 25; p++) {
+                unsigned char prefix[8];
+                char pstr[16];
+                size_t plen = rng_next() % 4;
+                size_t j;
+                long got;
+                int expected;
+
+                for (j = 0; j < plen; j++)
+                    prefix[j] = (unsigned char)
+                        rng_alphabet[rng_next() % (sizeof(rng_alphabet) - 1)];
+                memcpy(pstr, prefix, plen);
+                pstr[plen] = '\0';
+                expected = word_in_set(pstr, words, nwords) ? 1 : 0;
+                got = dafsa_prefix_enum(dp, prefix, plen,
+                                        enum_collect, &(enum_ctx){0});
+                assert(got == expected);
+                total++;
+            }
+        }
+        printf("  PASS: %d prefixes checked (incl. explicit ca/cat/cart)\n", total);
+        dafsa_free(dp);
+    }
+
+    /* ── Test 14: PDWG determinism ── */
+    printf("\n[M1 Test 14] PDWG determinism: save->load->save byte-identical\n");
+    {
+        const char *words[] = {"cat", "car", "cart", "do",
+                               "dog", "apple", "app", "apt", NULL};
+        dafsa *d = dafsa_create();
+        int i;
+        FILE *f1, *f2;
+        long s1, s2;
+        unsigned char *b1, *b2;
+
+        assert(d != NULL);
+        for (i = 0; words[i]; i++)
+            dafsa_add(d, (const unsigned char *)words[i]);
+        assert(dafsa_save(d, "/tmp/m1_det_1.pdwg") == 0);
+        dafsa_free(d);
+
+        d = dafsa_load("/tmp/m1_det_1.pdwg");
+        assert(d != NULL);
+        assert(dafsa_save(d, "/tmp/m1_det_2.pdwg") == 0);
+        dafsa_free(d);
+
+        f1 = fopen("/tmp/m1_det_1.pdwg", "rb");
+        f2 = fopen("/tmp/m1_det_2.pdwg", "rb");
+        assert(f1 && f2);
+        fseek(f1, 0, SEEK_END); s1 = ftell(f1); fseek(f1, 0, SEEK_SET);
+        fseek(f2, 0, SEEK_END); s2 = ftell(f2); fseek(f2, 0, SEEK_SET);
+        assert(s1 == s2);
+        b1 = malloc((size_t)s1);
+        b2 = malloc((size_t)s2);
+        assert(b1 && b2);
+        assert(fread(b1, 1, (size_t)s1, f1) == (size_t)s1);
+        assert(fread(b2, 1, (size_t)s2, f2) == (size_t)s2);
+        assert(memcmp(b1, b2, (size_t)s1) == 0);
+        free(b1); free(b2);
+        fclose(f1); fclose(f2);
+        remove("/tmp/m1_det_1.pdwg");
+        remove("/tmp/m1_det_2.pdwg");
+        printf("  PASS: byte-identical (%ld bytes)\n", s1);
+    }
 
     /* ── Summary ── */
     printf("\n=== All tests passed. ===\n");

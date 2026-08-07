@@ -19,6 +19,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <unistd.h>
 #include <assert.h>
 
 /* ─── Tunables ──────────────────────────────────────────────────────────── */
@@ -480,6 +481,27 @@ static void reg_insert(dafsa *d, uint64_t sig, unsigned int id)
     d->reg_used++;
 }
 
+/* Rebuild the register from scratch over all live states.  Merge operations
+ * leave stale sig->id entries pointing at dead/orphan states; a later state
+ * with the same signature would then merge into the wrong target.  Called
+ * after a delete (which merges) to guarantee a clean equivalence map. */
+static void reg_rebuild(dafsa *d)
+{
+    unsigned int i;
+
+    memset(d->reg_keys, 0, d->reg_cap * sizeof(uint64_t));
+    memset(d->reg_vals, 0, d->reg_cap * sizeof(uint32_t));
+    d->reg_used = 0;
+
+    for (i = 1; i < d->nstates; i++) {
+        if (d->states[i].refcount != 0 || i == d->initial) {
+            uint64_t sig = sig_compute(&d->states[i]);
+            d->states[i].sig = sig;
+            reg_insert(d, sig, i);
+        }
+    }
+}
+
 /* ─── Clone-on-write ──────────────────────────────────────────────────── */
 
 /* Clone state `sid`, return the clone's id. The clone gets refcount=0
@@ -542,6 +564,12 @@ static void replace_or_register(dafsa *d, unsigned int sid,
     if (equivalent != 0 && equivalent != sid) {
         /* --- MERGE: sid into equivalent --- */
         incoming_redirect(d, sid, equivalent);
+
+        /* Repoint the register entry: this signature now belongs to the
+         * surviving state `equivalent`, not the merged-away `sid`.  Leaving
+         * the stale sid entry would make a later state with the same signature
+         * merge into a dead id. */
+        reg_insert(d, new_sig, equivalent);
 
         /* parent's transition was updated by incoming_redirect.
          * Now parent's signature is dirty. */
@@ -630,53 +658,53 @@ int dafsa_add_n(dafsa *d, const unsigned char *key, size_t len)
     if (pos == len && d->states[current].is_final)
         return 0;  /* already in the DAFSA */
 
-    /* --- Clone-on-write for exact match (pos == len) --- */
-    if (pos == len && d->states[current].refcount > 1) {
-        unsigned int clone = clone_state(d, current);
-        unsigned int parent = path[path_len - 2];
-        unsigned char pc    = chars[path_len - 1];
+    /* --- Clone-on-write: make the prefix path private (ascending) ---
+     * Clone every shared state along the path from root toward the leaf.
+     * Each redirect targets the already-private parent path[di-1], so it
+     * never affects other words that share a sub-automaton.  This is required
+     * when re-adding a word whose (deleted) ghost branch is still shared with
+     * another word, as well as when adding a fresh suffix at a divergence. */
+    {
+        unsigned int di;
+        for (di = 1; di < path_len; di++) {
+            unsigned int sid = path[di];
+            if (d->states[sid].refcount > 1) {
+                unsigned int clone = clone_state(d, sid);
+                unsigned int parent = path[di - 1];
+                unsigned char pc    = chars[di];
 
-        incoming_redirect_one(d, parent, pc, current, clone);
-        /* Re-fetch by index: clone_state may have realloc'd states */
-        path[path_len - 1] = clone;
-        current = clone;
+                /* clone_state may realloc states; re-fetch via indices */
+                incoming_redirect_one(d, parent, pc, sid, clone);
+
+                /* Update path (and the parent pointer of the next element) */
+                path[di] = clone;
+                if (di + 1 < path_len)
+                    parents[di + 1] = clone;
+            }
+        }
+        current = path[path_len - 1];
     }
 
-    /* --- Phase 2: Clone-on-write from divergence, then add suffix --- */
+    /* --- Phase 2: Add suffix from the divergence point --- */
     if (pos < len) {
-        /* The state we stopped at (current) needs a new transition.
-         * If it's shared, clone it first. */
-        if (d->states[current].refcount > 1) {
-            unsigned int clone = clone_state(d, current);
-            unsigned int parent = path[path_len - 2];
-            unsigned char pc    = chars[path_len - 1];
+        unsigned int i;
+        for (i = pos; i < len; i++) {
+            unsigned char c = key[i];
+            unsigned int next;
 
-            incoming_redirect_one(d, parent, pc, current, clone);
-            path[path_len - 1] = clone;
-            current = clone;
-        }
+            next = state_new(d);   /* MAY REALLOC states */
+            /* re-fetch state via index -- current is an index, safe */
+            trans_add(&d->states[current], c, next);
+            d->states[current].sig = 0;  /* dirty */
 
-        /* Now add new transitions to create the suffix path */
-        {
-            unsigned int i;
-            for (i = pos; i < len; i++) {
-                unsigned char c = key[i];
-                unsigned int next;
+            incoming_add(d, current, c, next);  /* MAY REALLOC inodes */
 
-                next = state_new(d);   /* MAY REALLOC states */
-                /* re-fetch state via index -- current is an index, safe */
-                trans_add(&d->states[current], c, next);
-                d->states[current].sig = 0;  /* dirty */
+            path[path_len]    = next;
+            chars[path_len]   = c;
+            parents[path_len] = current;
+            path_len++;
 
-                incoming_add(d, current, c, next);  /* MAY REALLOC inodes */
-
-                path[path_len]    = next;
-                chars[path_len]   = c;
-                parents[path_len] = current;
-                path_len++;
-
-                current = next;
-            }
+            current = next;
         }
     }
 
@@ -685,6 +713,10 @@ int dafsa_add_n(dafsa *d, const unsigned char *key, size_t len)
     d->states[current].sig = 0;  /* dirty */
 
     confluence_path(d, path, chars, parents, path_len);
+
+    /* The confluence may have merged states, leaving stale register entries.
+     * Rebuild so the next operation starts from a clean equivalence map. */
+    reg_rebuild(d);
 
     return 1;
 }
@@ -735,23 +767,32 @@ int dafsa_delete_n(dafsa *d, const unsigned char *key, size_t len)
         return 0;  /* word is a prefix but not a word */
 
     /* --- Phase 2: Clone-on-write, bottom-up ---
-     * If any state on the path (including the final state) is shared
-     * (refcount > 1), clone it so we can safely modify it without
-     * affecting other words that share it. */
-    for (di = (int)path_len - 1; di >= 1; di--) {
-        unsigned int sid = path[di];
-        if (d->states[sid].refcount > 1) {
-            unsigned int clone = clone_state(d, sid);
-            unsigned int parent = parents[di];
-            unsigned char pc    = chars[di];
+     * Walk the path from the root toward the leaf (ascending).  At each step
+     * the parent (path[di-1]) is already private -- either it was cloned in
+     * the previous iteration (refcount == 1) or it had refcount == 1 to begin
+     * with -- so redirecting its single edge on the path cannot affect any
+     * other word.  (A descending walk would redirect the edge of a still-shared
+     * parent and corrupt words that share the sub-automaton.) */
+    {
+        for (di = 1; di < (int)path_len; di++) {
+            unsigned int sid = path[di];
+            if (d->states[sid].refcount > 1) {
+                unsigned int clone = clone_state(d, sid);
+                /* parent is the (possibly just-cloned) previous path state;
+                 * must re-read path[di-1], NOT the stale parents[] snapshot */
+                unsigned int parent = path[di - 1];
+                unsigned char pc    = chars[di];
 
-            /* clone_state may realloc states; re-fetch via indices */
-            incoming_redirect_one(d, parent, pc, sid, clone);
+                /* clone_state may realloc states; re-fetch via indices */
+                incoming_redirect_one(d, parent, pc, sid, clone);
 
-            /* Update path -- and current if this is the final state */
-            path[di] = clone;
-            if (di == (int)path_len - 1)
-                current = clone;
+                /* Update path -- and current if this is the final state */
+                path[di] = clone;
+                if (di < (int)path_len - 1)
+                    parents[di + 1] = clone;
+                if (di == (int)path_len - 1)
+                    current = clone;
+            }
         }
     }
 
@@ -760,6 +801,11 @@ int dafsa_delete_n(dafsa *d, const unsigned char *key, size_t len)
     d->states[current].sig = 0;
 
     confluence_path(d, path, chars, parents, path_len);
+
+    /* Delete merges states (via confluence), which leaves stale register
+     * entries pointing at merged-away/dead states.  Rebuild the register so
+     * a subsequent add of a re-used signature merges into a live state. */
+    reg_rebuild(d);
 
     return 1;
 }
@@ -798,32 +844,388 @@ int dafsa_delete(dafsa *d, const unsigned char *word)
     return dafsa_delete_n(d, word, strlen((const char *)word));
 }
 
-/* ─── Persistence stubs (M0) ───────────────────────────────────────────── */
+/* ─── Persistence ─────────────────────────────────────────────────────── */
 
+/* On-disk format (ROADMAP 1.3): all integers little-endian, explicit byte
+ * writes (State/Edge have padding; never fwrite raw structs).
+ *
+ *   HEADER:  magic[4]="PDWG"; u32 version=1; u32 n_states; u32 n_trans;
+ *            u32 initial_id=1; u32 n_final; u32 reserved=0
+ *   STATE TABLE: (n_states+1) x 8B, entry 0 = (0,0): per id: u32 trans_offset; u32 ntrans
+ *   FINAL BITMAP: ceil((n_states+1)/8) bytes; bit i set iff reachable state i is final
+ *   CSR TRANSITIONS: n_trans x 5B (u8 sym; u32 target_id), grouped by state in
+ *            state-table order, sorted by sym asc.  Sink 0 -> 0, else new id.
+ */
+
+static int put_u8(FILE *f, uint8_t v)
+{
+    return fputc(v, f) == EOF ? -1 : 0;
+}
+
+static int put_u32_le(FILE *f, uint32_t v)
+{
+    int i;
+    for (i = 0; i < 4; i++) {
+        if (put_u8(f, (uint8_t)(v & 0xFF)) != 0) return -1;
+        v >>= 8;
+    }
+    return 0;
+}
+
+static int get_u8(FILE *f, uint8_t *out)
+{
+    int c = fgetc(f);
+    if (c == EOF) return -1;
+    *out = (uint8_t)c;
+    return 0;
+}
+
+static int get_u32_le(FILE *f, uint32_t *out)
+{
+    uint32_t v = 0;
+    int i;
+    for (i = 0; i < 4; i++) {
+        int c = fgetc(f);
+        if (c == EOF) return -1;
+        v |= ((uint32_t)(uint8_t)c) << (8 * i);
+    }
+    *out = v;
+    return 0;
+}
+
+/* Save a compact, minimal form: BFS-renumber reachable states 1..N (initial
+ * -> 1), drop orphans (refcount 0 / unreachable).  Atomic: write path.tmp,
+ * fflush, fsync, fclose, rename.  Returns 0 on success, -1 on any error.
+ * `d` is const and is never mutated. */
+int dafsa_save(const dafsa *d, const char *path)
+{
+    FILE *f = NULL;
+    char *tmp_path = NULL;
+    uint32_t *old_to_new = NULL;
+    uint32_t *queue = NULL;
+    uint32_t *offsets = NULL;
+    unsigned char *visited = NULL;
+    uint32_t n_reach = 0, n_trans = 0, n_final = 0;
+    uint32_t head, tail, i, j;
+    size_t path_len;
+    int ok = -1;
+
+    if (!d || !path) return -1;
+
+    old_to_new = (uint32_t *)calloc(d->nstates, sizeof(uint32_t));
+    queue      = (uint32_t *)malloc(d->nstates * sizeof(uint32_t));
+    visited    = (unsigned char *)calloc(d->nstates, 1);
+    if (!old_to_new || !queue || !visited) goto out;
+
+    /* BFS from initial, renumber reachable states in BFS order 1..N */
+    head = 0; tail = 0;
+    queue[tail++] = d->initial;
+    visited[d->initial] = 1;
+    while (head < tail) {
+        uint32_t old = queue[head++];
+        const State *s = &d->states[old];
+        old_to_new[old] = ++n_reach;
+        if (s->is_final) n_final++;
+        n_trans += s->ntrans;
+        for (j = 0; j < s->ntrans; j++) {
+            uint32_t tgt = s->trans[j].target;
+            if (!visited[tgt]) {
+                visited[tgt] = 1;
+                queue[tail++] = tgt;
+            }
+        }
+    }
+
+    /* cumulative per-state transition offsets (BFS order = new id order):
+     * trans_offset[i] = start index into the CSR of state i's transitions */
+    offsets = (uint32_t *)calloc(n_reach + 1, sizeof(uint32_t));
+    if (!offsets) goto out;
+    {
+        uint32_t run = 0;
+        offsets[0] = 0;
+        for (i = 1; i <= n_reach; i++) {
+            offsets[i] = run;
+            run += d->states[queue[i - 1]].ntrans;
+        }
+    }
+
+    /* atomic: write to path.tmp then rename onto path */
+    path_len = strlen(path);
+    tmp_path = (char *)malloc(path_len + 5);
+    if (!tmp_path) goto out;
+    snprintf(tmp_path, path_len + 5, "%s.tmp", path);
+
+    f = fopen(tmp_path, "wb");
+    if (!f) goto out;
+
+    /* header */
+    if (put_u8(f, 'P') || put_u8(f, 'D') || put_u8(f, 'W') || put_u8(f, 'G'))
+        goto fail;
+    if (put_u32_le(f, 1)) goto fail;            /* version */
+    if (put_u32_le(f, n_reach)) goto fail;      /* n_states */
+    if (put_u32_le(f, n_trans)) goto fail;      /* n_trans */
+    if (put_u32_le(f, 1)) goto fail;            /* initial_id */
+    if (put_u32_le(f, n_final)) goto fail;      /* n_final */
+    if (put_u32_le(f, 0)) goto fail;            /* reserved */
+
+    /* state table: (n_states+1) x 8B, entry 0 = (0,0) */
+    if (put_u32_le(f, 0) || put_u32_le(f, 0)) goto fail;
+    for (i = 1; i <= n_reach; i++) {
+        const State *s = &d->states[queue[i - 1]];
+        if (put_u32_le(f, offsets[i])) goto fail;
+        if (put_u32_le(f, s->ntrans)) goto fail;
+    }
+
+    /* final bitmap: ceil((n_states+1)/8) bytes; bit 0 always 0 */
+    {
+        uint32_t nb = (n_reach + 8) / 8;
+        for (i = 0; i < nb; i++) {
+            uint8_t byte = 0;
+            for (j = 0; j < 8; j++) {
+                uint32_t idx = i * 8 + j;
+                if (idx >= 1 && idx <= n_reach &&
+                    d->states[queue[idx - 1]].is_final)
+                    byte |= (uint8_t)(1u << j);
+            }
+            if (put_u8(f, byte)) goto fail;
+        }
+    }
+
+    /* CSR: transitions grouped by state in state-table order (sym asc) */
+    for (i = 1; i <= n_reach; i++) {
+        const State *s = &d->states[queue[i - 1]];
+        for (j = 0; j < s->ntrans; j++) {
+            if (put_u8(f, s->trans[j].sym)) goto fail;
+            if (put_u32_le(f, old_to_new[s->trans[j].target])) goto fail;
+        }
+    }
+
+    if (ferror(f)) goto fail;
+
+    /* atomic commit */
+    if (fflush(f) != 0) goto fail;
+    if (fsync(fileno(f)) != 0) goto fail;
+    if (fclose(f) != 0) { f = NULL; goto fail; }
+    f = NULL;
+    if (rename(tmp_path, path) != 0) goto fail;
+
+    ok = 0;
+    goto out;
+
+fail:
+    if (f) fclose(f);
+    if (tmp_path) remove(tmp_path);
+    ok = -1;
+
+out:
+    free(tmp_path);
+    free(old_to_new);
+    free(queue);
+    free(offsets);
+    free(visited);
+    return ok;
+}
+
+/* Materialize the on-disk compact form back into a fully mutable DAFSA:
+ * rebuilds the incoming-edge lists (refcount + in_head) and the register.
+ * Returns the handle, or NULL on any error (partial handle freed). */
 dafsa *dafsa_load(const char *path)
 {
-    (void)path;
+    FILE *f = NULL;
+    dafsa *d = NULL;
+    uint32_t *trans_offsets = NULL;
+    uint8_t *final_bits = NULL;
+    uint32_t version, n_states, n_trans, initial_id, n_final, reserved;
+    uint32_t running;
+    size_t bitmap_bytes;
+    uint32_t i, j;
+
+    if (!path) return NULL;
+
+    f = fopen(path, "rb");
+    if (!f) return NULL;
+
+    /* header */
+    {
+        uint8_t magic[4];
+        if (get_u8(f, &magic[0]) || get_u8(f, &magic[1]) ||
+            get_u8(f, &magic[2]) || get_u8(f, &magic[3]))
+            goto fail;
+        if (magic[0] != 'P' || magic[1] != 'D' ||
+            magic[2] != 'W' || magic[3] != 'G')
+            goto fail;
+    }
+    if (get_u32_le(f, &version) || get_u32_le(f, &n_states) ||
+        get_u32_le(f, &n_trans) || get_u32_le(f, &initial_id) ||
+        get_u32_le(f, &n_final) || get_u32_le(f, &reserved))
+        goto fail;
+    (void)reserved;
+    if (version != 1) goto fail;
+    if (initial_id != 1) goto fail;
+    if (n_states == 0) goto fail;                       /* initial must exist */
+    if ((size_t)n_states + 1 > SIZE_MAX / sizeof(State)) goto fail;
+
+    d = dafsa_create();
+    if (!d) goto fail;
+
+    /* grow states array to hold n_states+1 entries */
+    if ((size_t)n_states + 1 > d->states_cap) {
+        size_t new_cap = (size_t)n_states + 1;
+        State *new_states = (State *)realloc(d->states, new_cap * sizeof(State));
+        if (!new_states) goto fail;
+        memset(new_states + d->states_cap, 0,
+               (new_cap - d->states_cap) * sizeof(State));
+        d->states = new_states;
+        d->states_cap = new_cap;
+    }
+    d->nstates = n_states + 1;
+    d->initial = 1;
+
+    /* zero sink + live states; restore self indices */
+    memset(d->states, 0, (size_t)(n_states + 1) * sizeof(State));
+    for (i = 0; i <= n_states; i++)
+        d->states[i].id = i;
+
+    trans_offsets = (uint32_t *)malloc((n_states + 1) * sizeof(uint32_t));
+    if (!trans_offsets) goto fail;
+
+    /* state table: entry 0 = sink (0,0) */
+    {
+        uint32_t off, nt;
+        if (get_u32_le(f, &off) || get_u32_le(f, &nt)) goto fail;
+        if (off != 0 || nt != 0) goto fail;
+    }
+    for (i = 1; i <= n_states; i++) {
+        uint32_t off, nt;
+        if (get_u32_le(f, &off) || get_u32_le(f, &nt)) goto fail;
+        if (nt > ALPHABET_SZ) goto fail;                /* >256 impossible */
+        trans_offsets[i] = off;
+        d->states[i].ntrans = nt;
+    }
+
+    /* validate offsets are cumulative and consistent with n_trans */
+    running = 0;
+    for (i = 1; i <= n_states; i++) {
+        if (trans_offsets[i] != running) goto fail;
+        running += d->states[i].ntrans;
+    }
+    if (running != n_trans) goto fail;
+
+    /* final bitmap */
+    bitmap_bytes = (size_t)((n_states + 8) / 8);
+    final_bits = (uint8_t *)malloc(bitmap_bytes);
+    if (!final_bits) goto fail;
+    if (fread(final_bits, 1, bitmap_bytes, f) != bitmap_bytes) goto fail;
+    {
+        uint32_t finals = 0;
+        for (i = 1; i <= n_states; i++) {
+            if (final_bits[i / 8] & (uint8_t)(1u << (i % 8))) {
+                d->states[i].is_final = 1;
+                finals++;
+            }
+        }
+        if (finals != n_final) goto fail;
+    }
+
+    /* CSR: direct copy into trans[] (already sorted, no trans_add) */
+    for (i = 1; i <= n_states; i++) {
+        State *s = &d->states[i];
+        for (j = 0; j < s->ntrans; j++) {
+            uint8_t sym;
+            uint32_t target;
+            if (get_u8(f, &sym) || get_u32_le(f, &target)) goto fail;
+            if (target > n_states) goto fail;           /* 0 = sink, else 1..N */
+            s->trans[j].sym = sym;
+            s->trans[j].target = target;
+        }
+    }
+
+    /* rebuild incoming edges: restores refcount + in_head */
+    for (i = 1; i <= n_states; i++) {
+        State *s = &d->states[i];
+        for (j = 0; j < s->ntrans; j++)
+            incoming_add(d, i, s->trans[j].sym, s->trans[j].target);
+    }
+
+    /* rebuild register: sig_compute + reg_insert per live state */
+    for (i = 1; i <= n_states; i++) {
+        State *s = &d->states[i];
+        uint64_t sig = sig_compute(s);
+        s->sig = sig;
+        reg_insert(d, sig, i);
+    }
+
+    fclose(f);
+    free(trans_offsets);
+    free(final_bits);
+    return d;
+
+fail:
+    if (f) fclose(f);
+    dafsa_free(d);
+    free(trans_offsets);
+    free(final_bits);
     return NULL;
 }
 
-int dafsa_save(const dafsa *d, const char *path)
+/* ─── Prefix enumeration ──────────────────────────────────────────────── */
+
+/* Recursive DFS from `state`, appending transition bytes into buf.  Calls
+ * cb at each final state with the accumulated payload (bytes collected after
+ * the 0x00 edge).  Returns non-zero to stop early. */
+static int enum_dfs(const dafsa *d, unsigned int state, unsigned char *buf,
+                    size_t depth, dafsa_enum_cb cb, void *user, long *count)
 {
-    (void)d;
-    (void)path;
-    return -1;
+    const State *s = &d->states[state];
+    uint32_t j;
+
+    if (s->is_final) {
+        (*count)++;
+        if (cb(buf, depth, user) != 0) return 1;
+    }
+    if (depth >= MAX_WORD_LEN) return 0;
+    for (j = 0; j < s->ntrans; j++) {
+        buf[depth] = (unsigned char)s->trans[j].sym;
+        if (enum_dfs(d, s->trans[j].target, buf, depth + 1,
+                     cb, user, count) != 0)
+            return 1;
+    }
+    return 0;
 }
 
-/* ─── Prefix enumeration stub (M0) ─────────────────────────────────────── */
-
+/* Enumerate keys of form prefix || 0x00 || payload.  Walks the prefix from
+ * the initial state, requires a 0x00 edge next (W\0 semantics), then DFS the
+ * payload states calling cb(payload, len).  Returns the number of keys
+ * enumerated; 0 if the prefix is absent or not a key boundary. */
 long dafsa_prefix_enum(const dafsa *d, const unsigned char *prefix,
                        size_t prefix_len, dafsa_enum_cb cb, void *user)
 {
-    (void)d;
-    (void)prefix;
-    (void)prefix_len;
-    (void)cb;
-    (void)user;
-    return -1;
+    unsigned int current;
+    unsigned char buf[MAX_WORD_LEN];
+    size_t i;
+    int tr;
+    long count = 0;
+
+    if (!d || !cb) return -1;
+    if (prefix == NULL && prefix_len > 0) return 0;
+    if (prefix_len > MAX_WORD_LEN) return 0;
+
+    current = d->initial;
+
+    /* walk the prefix */
+    for (i = 0; i < prefix_len; i++) {
+        tr = trans_find(&d->states[current], prefix[i]);
+        if (tr < 0) return 0;
+        current = d->states[current].trans[tr].target;
+    }
+
+    /* W\0 semantics: a 0x00 edge must exist from the final prefix state */
+    tr = trans_find(&d->states[current], 0x00);
+    if (tr < 0) return 0;
+    current = d->states[current].trans[tr].target;
+
+    enum_dfs(d, current, buf, 0, cb, user, &count);
+    return count;
 }
 
 /* ─── Statistics ───────────────────────────────────────────────────────── */

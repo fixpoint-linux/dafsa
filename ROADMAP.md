@@ -160,7 +160,7 @@ struct dafsa {
 Magic `"PDWG"`, version 1, all integers little-endian. Compact form: BFS-renumber reachable states to 1..N (initial → 1), **drop orphans** (refcount 0, unreachable). Orphans never serialized; load materializes only reachable states, so on-disk is always minimal (compaction on every save).
 
 ```
-HEADER (32 bytes)
+HEADER (28 bytes)
   u8  magic[4]      = "PDWG"
   u32 version       = 1
   u32 n_states      ; live reachable states (ids 1..n_states); sink 0 not counted
@@ -179,6 +179,8 @@ CSR TRANSITIONS  n_trans x 5 bytes, grouped by state in state-table order, sorte
   u8  sym
   u32 target_id    ; remapped live id (1..n_states), or 0 = sink
 ```
+
+> **Header size (corrected 2026-08-07):** the header is **28 bytes**, not 32 — `magic[4]` (4) + six `u32` fields (24). Implemented so in `dafsa_save`/`dafsa_load`; verified byte-identical round-trip (Test 14). Any M2 Rust reader must parse a **28-byte** header.
 
 **Save algorithm:**
 1. BFS from `initial`, collect reachable states in BFS order, build `old→new` id map (new ids 1..N, initial→1). Sink 0 → 0.
@@ -505,6 +507,8 @@ After M2, run `target/release/fst-indexer build` on the real corpora and read `d
 **Steps:** `dafsa_save` (BFS-renumber, header, state table, final bitmap, CSR, atomic write); `dafsa_load` (materialize, rebuild inodes, rebuild register); `dafsa_prefix_enum`; `dafsa_stats(out)`; tests.
 **Done when:** `make test` green; round-trip preserves lookup set across save/load for ≥10 trials of ≥1000 random keys; delete differential passes ≥50 trials; `prefix_enum` matches brute-force for ≥20 prefixes.
 
+**STATUS: DONE (2026-08-07).** Implemented `dafsa_save`/`dafsa_load`/`dafsa_prefix_enum`; `make test` passes all 14 tests (10 M0 + 4 M1: round-trip ×10 trials ×1200 keys, delete differential ×60 trials ×200 words, prefix enum ×28 prefixes incl. explicit `ca`→0, PDWG byte-identical determinism). On-disk header is **28 bytes** (see §1.3). **Pre-existing incremental bugs fixed** (exposed by the mandatory delete differential — this was the flagged `dafsa_delete_n` risk): (1) `delete_n` Phase 2 now clones **ascending** (was descending, corrupting shared sub-automata) and uses updated `path[di-1]`; (2) `add_n` now clones shared ancestors on re-add (was only cloning the terminal); (3) register staleness (pre-existing SF1) fixed via `reg_rebuild()` after confluence in both `add_n` and `delete_n`. **Known cost:** `reg_rebuild()` is O(nstates) per op — see Q12. No debug remnants; `dafsa.h` unchanged. Uncommitted (working tree modified).
+
 ### M2 — Rust FFI + `build`/`search` on DAFSA, drop `fst` crate
 **Files:** `Cargo.toml`, `build.rs` (new), `c/dafsa.{c,h}` (vendored via `make sync`), `src/ffi.rs` (new), `src/lib.rs` (rewrite build/open/search, drop fst), `src/main.rs` (unchanged CLI).
 **Steps:** `make sync`; add `cc` build-dep + build.rs; write `ffi.rs`; rewrite `build`/`open`/`search`; `cargo test`; verify native `cc` (Q2); run differential script on `/tmp` corpus.
@@ -527,6 +531,7 @@ After M2, run `target/release/fst-indexer build` on the real corpora and read `d
 - **Q1 (CRITICAL, measurement required):** reachable-state count on real corpus vs dense `trans[256]` ~2 KiB/state RAM. Measure at M2 gate; if >5M states (~10 GiB), branch M2.5 to convert `trans[]` to heap sparse. On-disk CSR is already sparse, so disk is fine regardless.
 - **Q2 (build-blocking):** `cc` crate must pick native `gcc`/`clang`, not cosmocc (sandbox aliases all to cosmocc, which emits APE objects that won't link into a native Rust binary). Verify at start of M2; set `CC=gcc` if needed.
 - **Q3:** orphan accumulation within a single `update` process (never serialized; fresh process per update; nightly build resets). Acceptable for hourly cadence.
+- **Q12 (2026-08-07, performance):** `reg_rebuild()` in `dafsa_add_n`/`dafsa_delete_n` is **O(nstates) per op** — it clears and rebuilds the register over all live states after every confluence. This is the conservative fix for register staleness (SF1) and is correct, but it is too slow for the M2 real-corpus incremental path (millions of states → O(N²) over a build). **Revisit before M3/M2 hot path:** (a) restore incremental register maintenance (repair `replace_or_register` so it updates existing entries instead of leaving stale `sig→dead_id` mappings), and/or (b) only `reg_rebuild` when a merge actually occurred, and/or (c) batch deletes/adds per `update` and rebuild once at the end. Not a blocker for M1 (PoC/tests); gate on Q1's state-count measurement.
 - **Q4 (RESOLVED 2026-08-06):** `palimpsest-setup/scripts/palimpsest-reindex.py` and `setup.sh` **verified** via `bash` (the sandbox could not reach them, but the read-only bash tool could). Exact facts:
   - `palimpsest-reindex.py` (29 lines): imports `load_config` + `build_index`; loops `cfg.domains.items()`, calls `build_index(dc)` at line 20, returns 0 unless `"not found"` in msg. **Matches the roadmap's §7.2 assumption exactly.**
   - `setup.sh` (181 lines): step 3 builds `fst-indexer` via `cargo build --release` + `install` to `~/.local/bin/fst-indexer` (lines 44-46). Step 8 writes the systemd units via heredocs — `palimpsest-reindex.{service,timer}` at lines 104-119 (hourly `OnCalendar=*:0`), `summarize` (121-136), `gardener` nightly 02:00 (138-153), `subagent-meta` nightly 03:00 (155-170); `enable --now` all four at 172-175. Scripts installed via `install -m 0755` at 82-89.
