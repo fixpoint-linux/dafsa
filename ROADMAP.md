@@ -1,8 +1,8 @@
-# Roadmap: Replace the Rust `fst` backend with the Carrasco–Forcada C DAWG (`dafsa`)
+# Roadmap: Replace the Rust `fst` backend with the Carrasco–Forcada C DAFSA (`dafsa`)
 
 **Status:** Approved plan (2026-08-06). Decision log and detailed file-by-file plan below.
-**Naming (D10, decided 2026-08-06):** the DAWG core / PoC is named **`dafsa`** (Deterministic Acyclic Finite State Automaton). The deployed binary **stays `fst-indexer`** for drop-in compatibility (`web-archive-mcp/server.py:602` hardcodes it; config points at it).
-**Scope:** Replaces the `fst` crate search backend in the palimpsest toolkit (`unified-history-mcp`, via `fst-indexer`) with the Carrasco–Forcada incremental minimal acyclic DFA in `dawg.c`.
+**Naming (D10, decided 2026-08-06):** the DAFSA core / PoC is named **`dafsa`** (Deterministic Acyclic Finite State Automaton). The deployed binary **stays `fst-indexer`** for drop-in compatibility (`web-archive-mcp/server.py:602` hardcodes it; config points at it).
+**Scope:** Replaces the `fst` crate search backend in the palimpsest toolkit (`unified-history-mcp`, via `fst-indexer`) with the Carrasco–Forcada incremental minimal acyclic DFA in `dafsa.c`.
 
 ---
 
@@ -11,20 +11,20 @@
 Every decision made during this planning session, recorded for reference.
 
 ### D1. Approach: hybrid, not standalone C binary
-Keep the `fst-indexer` Rust binary (same name, same CLI, same JSON, same `manifest.json` *shape*). Drop the `fst` crate. Compile the C DAWG core in via the `cc` crate + FFI. Tokenization, globbing, `jsonl`/`txt`/`transcript` extractors, and manifest writing **stay in Rust, byte-for-byte unchanged**.
+Keep the `fst-indexer` Rust binary (same name, same CLI, same JSON, same `manifest.json` *shape*). Drop the `fst` crate. Compile the C DAFSA core in via the `cc` crate + FFI. Tokenization, globbing, `jsonl`/`txt`/`transcript` extractors, and manifest writing **stay in Rust, byte-for-byte unchanged**.
 
-- **Rationale:** re-porting JSON parsing, JSON string escaping, globbing, and transcript parsing to C is the highest-parity-risk work and buys nothing the user asked for. The only thing a standalone C `dawg-indexer` (M4, deferred) buys is shedding the Rust toolchain, which is not a requirement.
+- **Rationale:** re-porting JSON parsing, JSON string escaping, globbing, and transcript parsing to C is the highest-parity-risk work and buys nothing the user asked for. The only thing a standalone C `dafsa-indexer` (M4, deferred) buys is shedding the Rust toolchain, which is not a requirement.
 
 ### D2. Incremental strategy: TRUE INCREMENTAL
 User explicitly chose **True incremental (B)** over (A) event-driven full rebuild and (C) hybrid append + nightly compaction:
-- Persistent read-write DAWG (load → mutate → save).
+- Persistent read-write DAFSA (load → mutate → save).
 - Append-only file slots + tombstones for a **stable `file_idx`**.
-- Per-file key sidecar so `update` can `dawg_delete` old keys and `dawg_add` new ones.
+- Per-file key sidecar so `update` can `dafsa_delete` old keys and `dafsa_add` new ones.
 - New `update` subcommand; **drop the hourly reindex timer**; keep a cheap nightly `build` as compaction/GC.
-- `dawg_delete_n` is load-bearing → randomized differential tests mandatory.
+- `dafsa_delete_n` is load-bearing → randomized differential tests mandatory.
 
 ### D3. Length-delimited key API (NUL-in-keys)
-The composite key `{word}\0{file_idx:u32BE}{entry_idx:u32BE}` embeds a NUL separator, but the existing `dawg.c` API is `strlen`-based. **Every key API must be length-delimited** (`dawg_add_n`/`dawg_lookup_n`/`dawg_delete_n`); the old `strlen` wrappers are kept as thin shims.
+The composite key `{word}\0{file_idx:u32BE}{entry_idx:u32BE}` embeds a NUL separator, but the existing `dafsa.c` API is `strlen`-based. **Every key API must be length-delimited** (`dafsa_add_n`/`dafsa_lookup_n`/`dafsa_delete_n`); the old `strlen` wrappers are kept as thin shims.
 
 ### D4. On-disk format is ours to replace
 `index.fst` contents are ours to define (only `fst-indexer` reads it), but the **filename must stay `index.fst`** (consumer checks `idx_dir/"index.fst"` at `indexer.py:131`). The `manifest.json` contract is shared with Python and must keep its shape.
@@ -36,18 +36,23 @@ The composite key `{word}\0{file_idx:u32BE}{entry_idx:u32BE}` embeds a NUL separ
 - Only `build` (compaction) renumbers, producing a dense manifest.
 
 ### D6. Prefix semantics = `W\0`, not `W`
-DAWG walks `word`, **requires a `\0` edge next**, then enumerates payloads. Query `"ca"` must NOT return `"cat"` hits. Mandatory explicit test.
+DAFSA walks `word`, **requires a `\0` edge next**, then enumerates payloads. Query `"ca"` must NOT return `"cat"` hits. Mandatory explicit test.
 
 ### D7. `MAX_STATES=100000` is too small
 Convert the fixed arrays to heap `malloc`/`realloc` with doubling grow. Remove `MAX_STATES`/`REGISTER_SZ` caps. **Measure real-corpus reachable-state count before M2 gate** (Q1).
 
 ### D8. Deployment/ownership decisions
 - `fst-indexer` stays a normal native Rust binary (NOT cosmocc/APE). `build.rs` uses system `cc`.
-- Vendored C lives at `fst-indexer/c/dawg.{c,h}` (copy of the PoC source); PoC `Makefile` gets a `sync` target.
+- Vendored C lives at `fst-indexer/c/dafsa.{c,h}` (copy of the PoC source); PoC `Makefile` gets a `sync` target.
 - `web-archive-mcp` `rebuild()` and `dns-whois-mcp` `storage.py` are **unchanged**.
 - Cosmocc is only used for the standalone PoC test binary.
 
 ### D9. Phasing (M0–M4) — see Part 3.
+
+### D11. Standardize on `dafsa` prefix; remove legacy `dawg.c`
+- The M0 refactor produced `dafsa.h`/`dafsa.c`/`dafsa_test.c` with an opaque `dafsa` type and a `dafsa_`-prefixed API.
+- On 2026-08-06 the old `dawg.c` was deleted from the working tree and the repo standardized on `dafsa` (commit 27d6d62); build artifacts (`dafsa.aarch64.elf`, `dafsa.com.dbg`, `dawg.com.dbg`) were removed.
+- `dawg.c` remains recoverable in git history (commit ccba17b).
 
 ---
 
@@ -55,23 +60,23 @@ Convert the fixed arrays to heap `malloc`/`realloc` with doubling grow. Remove `
 
 ## 0. Guiding decisions (locked)
 
-- **Hybrid**: keep `fst-indexer` Rust binary, drop `fst` crate, compile C DAWG via `cc` crate + FFI.
+- **Hybrid**: keep `fst-indexer` Rust binary, drop `fst` crate, compile C DAFSA via `cc` crate + FFI.
 - **Tokenization/globbing/extractors/manifest-writing stay in Rust**, byte-for-byte unchanged.
-- **True incremental**: persistent RW DAWG, append-only slots + tombstones, per-file sidecar, `update` subcommand, drop hourly timer, keep nightly `build` compaction.
+- **True incremental**: persistent RW DAFSA, append-only slots + tombstones, per-file sidecar, `update` subcommand, drop hourly timer, keep nightly `build` compaction.
 - **C source is portable C99**, compiled two ways: (a) system `cc` via `cc` crate for Rust binary; (b) `cosmocc` for standalone PoC test binary. **cosmocc is NOT used by `build.rs`.**
-- `dawg_delete_n` is load-bearing → randomized differential tests mandatory.
+- `dafsa_delete_n` is load-bearing → randomized differential tests mandatory.
 
 ---
 
-## 1. New DAWG C API (`dawg.h`)
+## 1. New DAFSA C API (`dafsa.h`)
 
-Refactor to an **opaque handle** (`dawg *`), heap-allocated/growable arrays, length-delimited key ops, persistence, and prefix enumeration. The PoC `main()` test harness moves to `dawg_test.c`.
+Refactor to an **opaque handle** (`dafsa *`), heap-allocated/growable arrays, length-delimited key ops, persistence, and prefix enumeration. The PoC `main()` test harness moves to `dafsa_test.c`.
 
-### 1.1 Header `dawg.h`
+### 1.1 Header `dafsa.h`
 
 ```c
-#ifndef DAWG_H
-#define DAWG_H
+#ifndef DAFSA_H
+#define DAFSA_H
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -80,33 +85,33 @@ Refactor to an **opaque handle** (`dawg *`), heap-allocated/growable arrays, len
 extern "C" {
 #endif
 
-typedef struct dawg dawg;   /* opaque */
+typedef struct dafsa dafsa;   /* opaque */
 
 /* --- lifecycle --- */
-dawg *dawg_create(void);                 /* empty DAWG; NULL on OOM */
-void   dawg_free(dawg *d);              /* NULL-safe */
+dafsa *dafsa_create(void);                 /* empty DAFSA; NULL on OOM */
+void   dafsa_free(dafsa *d);              /* NULL-safe */
 
 /* --- persistence (read-write, mutable load) --- */
-dawg *dawg_load(const char *path);       /* materialize on-disk form into a mutable DAWG; NULL on error */
-int   dawg_save(const dawg *d, const char *path); /* atomic: path.tmp, fsync, rename. 0=ok, -1=err */
+dafsa *dafsa_load(const char *path);       /* materialize on-disk form into a mutable DAFSA; NULL on error */
+int   dafsa_save(const dafsa *d, const char *path); /* atomic: path.tmp, fsync, rename. 0=ok, -1=err */
 
 /* --- length-delimited key ops (keys MAY contain NUL) --- */
-int dawg_add_n    (dawg *d, const unsigned char *key, size_t len); /* 1 added, 0 dup, -1 err */
-int dawg_lookup_n (const dawg *d, const unsigned char *key, size_t len); /* 1/0 */
-int dawg_delete_n (dawg *d, const unsigned char *key, size_t len); /* 1 deleted, 0 absent, -1 err */
+int dafsa_add_n    (dafsa *d, const unsigned char *key, size_t len); /* 1 added, 0 dup, -1 err */
+int dafsa_lookup_n (const dafsa *d, const unsigned char *key, size_t len); /* 1/0 */
+int dafsa_delete_n (dafsa *d, const unsigned char *key, size_t len); /* 1 deleted, 0 absent, -1 err */
 
 /* --- NUL-terminated convenience (legacy/PoC) --- */
-int dawg_add    (dawg *d, const unsigned char *word);
-int dawg_lookup (const dawg *d, const unsigned char *word);
-int dawg_delete (dawg *d, const unsigned char *word);
+int dafsa_add    (dafsa *d, const unsigned char *word);
+int dafsa_lookup (const dafsa *d, const unsigned char *word);
+int dafsa_delete (dafsa *d, const unsigned char *word);
 
 /* --- prefix enumeration (W\0 semantics) ---
  * Enumerate keys of form: prefix || 0x00 || payload.
  * Walks prefix, requires a 0x00 edge next, then DFS, calling cb(payload, len)
  * for each final state reached. Returns count or -1. Stops early if cb != 0. */
-typedef int (*dawg_enum_cb)(const unsigned char *payload, size_t payload_len, void *user);
-long dawg_prefix_enum(const dawg *d, const unsigned char *prefix, size_t prefix_len,
-                      dawg_enum_cb cb, void *user);
+typedef int (*dafsa_enum_cb)(const unsigned char *payload, size_t payload_len, void *user);
+long dafsa_prefix_enum(const dafsa *d, const unsigned char *prefix, size_t prefix_len,
+                      dafsa_enum_cb cb, void *user);
 
 /* --- stats --- */
 typedef struct {
@@ -115,11 +120,11 @@ typedef struct {
     uint32_t n_final;
     uint32_t n_trans;
     uint64_t register_probes;
-} dawg_stats_out;
-void dawg_stats(const dawg *d, dawg_stats_out *out);
+} dafsa_stats_out;
+void dafsa_stats(const dafsa *d, dafsa_stats_out *out);
 
 /* --- debug --- */
-void dawg_dot(const dawg *d, FILE *f);
+void dafsa_dot(const dafsa *d, FILE *f);
 
 #ifdef __cplusplus
 }
@@ -127,10 +132,10 @@ void dawg_dot(const dawg *d, FILE *f);
 #endif
 ```
 
-### 1.2 Internal struct changes (in `dawg.c`)
+### 1.2 Internal struct changes (in `dafsa.c`)
 
 ```c
-struct dawg {
+struct dafsa {
     uint32_t nstates;          /* state 0 = sink sentinel */
     uint32_t initial;          /* == 1 after create/load */
     State   *states;            /* heap, capacity states_cap */
@@ -147,7 +152,7 @@ struct dawg {
 
 - `State` keeps the dense `Edge trans[ALPHABET_SZ]` in-memory (the incremental algorithm relies on sorted-array binary search + `memmove` insert). `ALPHABET_SZ` stays 256. State ≈ 2 KiB; with heap growth we can reach millions of states.
 - `state_new` doubles `states` (initial cap e.g. 4096); `inode_alloc` grows `inodes`; `reg_insert`/`reg_lookup` grow + rehash when load factor > 0.7.
-- Remove `MAX_STATES`, `REGISTER_SZ`; introduce `DAWG_MAX_STATES_HARD = 100_000_000` as sanity abort.
+- Remove `MAX_STATES`, `REGISTER_SZ`; introduce `DAFSA_MAX_STATES_HARD = 100_000_000` as sanity abort.
 - **Pointer-safety audit (load-bearing):** grep for every `State *`/`Inode *` held across a call that may realloc (`state_new`, `inode_alloc`, `reg_insert`-grow); convert dangling pointers to index-based re-fetch.
 
 ### 1.3 On-disk serialization layout (`index.fst`)
@@ -183,7 +188,7 @@ CSR TRANSITIONS  n_trans x 5 bytes, grouped by state in state-table order, sorte
 
 **Load algorithm:**
 1. Read & validate header (magic, version).
-2. `dawg_create()`; grow `states` to `n_states+1`; set `nstates`, `initial`.
+2. `dafsa_create()`; grow `states` to `n_states+1`; set `nstates`, `initial`.
 3. Read state table (skip entry 0); store `trans_offset`/`ntrans` per id.
 4. Read final bitmap → set `is_final`.
 5. Read CSR → populate `states[i].trans[]` via direct copy (already sorted, no `trans_add`); set `ntrans`; `sig = 0`.
@@ -191,7 +196,7 @@ CSR TRANSITIONS  n_trans x 5 bytes, grouped by state in state-table order, sorte
 7. **Rebuild register:** for each live state s in 1..n_states: `sig = sig_compute(&states[s])`; `reg_insert(d, sig, s)`.
 8. Return handle.
 
-### 1.4 `dawg_prefix_enum`
+### 1.4 `dafsa_prefix_enum`
 
 ```
 walk prefix from initial; if any transition missing → return 0
@@ -208,7 +213,7 @@ Bounded by max key length (4096). For `fst-indexer` payload is always 8 bytes �
 ## 2. Sidecar format (per-file key store)
 
 - **Location:** `<index_dir>/slots/<file_idx>.keys` — one per non-tombstoned slot. Absence == tombstone.
-- **Purpose:** lets `update` reconstruct exact keys for a file so it can `dawg_delete_n` them before re-adding. DAWG key = `word || 0x00 || file_idx_be(4) || entry_idx_be(4)`. `file_idx` is the slot (known from path), NOT stored per-record.
+- **Purpose:** lets `update` reconstruct exact keys for a file so it can `dafsa_delete_n` them before re-adding. DAFSA key = `word || 0x00 || file_idx_be(4) || entry_idx_be(4)`. `file_idx` is the slot (known from path), NOT stored per-record.
 - **Record layout** (LE, length-prefixed words):
 ```
 ; repeated until EOF:
@@ -216,9 +221,9 @@ Bounded by max key length (4096). For `fst-indexer` payload is always 8 bytes �
   u32 word_len
   u8  word[word_len]
 ```
-- **Dedup:** within one file, dedup `(entry_idx, word)` via a `HashSet<(u32, Vec<u8>)>` before writing sidecar and before `dawg_add_n`. (`dawg_add_n` is idempotent, but sidecar must be deduped to avoid redundant `dawg_delete_n` and inflated size.)
-- **Consistency invariant:** `slots/<file_idx>.keys` reflects the keys currently in the DAWG for `file_idx`.
-- **Crash-safety ordering:** DAWG is saved *before* sidecars are overwritten, so a crash leaves (new DAWG + old sidecar) → next `update` reads old sidecar, `dawg_delete_n` of absent keys (no-op), re-extracts, re-adds → converges with no ghosts.
+- **Dedup:** within one file, dedup `(entry_idx, word)` via a `HashSet<(u32, Vec<u8>)>` before writing sidecar and before `dafsa_add_n`. (`dafsa_add_n` is idempotent, but sidecar must be deduped to avoid redundant `dafsa_delete_n` and inflated size.)
+- **Consistency invariant:** `slots/<file_idx>.keys` reflects the keys currently in the DAFSA for `file_idx`.
+- **Crash-safety ordering:** DAFSA is saved *before* sidecars are overwritten, so a crash leaves (new DAFSA + old sidecar) → next `update` reads old sidecar, `dafsa_delete_n` of absent keys (no-op), re-extracts, re-adds → converges with no ghosts.
 
 ---
 
@@ -270,7 +275,7 @@ fst-indexer update -i <index_dir> --dir <root> --pattern <glob> --extractor <jso
 ```
 Exit 0 on success, non-zero on error. Stdout JSON:
 ```json
-{"command":"update","index_dir":"<path>","unchanged":N,"updated":N,"added":N,"removed":N,"total_slots":N,"dawg_states_reachable":N}
+{"command":"update","index_dir":"<path>","unchanged":N,"updated":N,"added":N,"removed":N,"total_slots":N,"dafsa_states_reachable":N}
 ```
 
 ### 4.2 Algorithm
@@ -278,7 +283,7 @@ Exit 0 on success, non-zero on error. Stdout JSON:
 update(index_dir, dir, pattern, extractor):
   if not exists(index_dir/index.fst):
       return build(dir, pattern, extractor, index_dir)   # fresh, dense (first run)
-  d = dawg_load(index_dir/index.fst)
+  d = dafsa_load(index_dir/index.fst)
   manifest = load index_dir/manifest.json
   live = { manifest[i].filename : i for i if not manifest[i].tombstoned }
   disk = collect_files(dir, pattern)
@@ -291,38 +296,38 @@ update(index_dir, dir, pattern, extractor):
           if prev.mtime == stat.mtime and prev.size == stat.size: continue  # unchanged
           # CHANGED: delete old keys (from sidecar), re-extract, add new keys, rewrite sidecar+entry
           for (ei, w) in read slots/<slot>.keys:
-              dawg_delete_n(d, w\0 + slot_be + ei_be)
+              dafsa_delete_n(d, w\0 + slot_be + ei_be)
           (fe, entries) = extract(extractor, f, rel)
           pairs = dedup_per_entry(entries)
-          for (ei, w) in pairs: dawg_add_n(d, w\0 + slot_be + ei_be)
+          for (ei, w) in pairs: dafsa_add_n(d, w\0 + slot_be + ei_be)
           manifest[slot] = fe with mtime/size/tombstoned=false
       else:
           slot = len(manifest)   # NEW FILE → append
           (fe, entries) = extract(extractor, f, rel); pairs = dedup_per_entry(entries)
-          for (ei, w) in pairs: dawg_add_n(d, w\0 + slot_be + ei_be)
+          for (ei, w) in pairs: dafsa_add_n(d, w\0 + slot_be + ei_be)
           manifest.push(fe with mtime/size/tombstoned=false)
 
   disk_rel = set(rel for f in disk)
   for i in 0..len(manifest):
       if not manifest[i].tombstoned and manifest[i].filename not in disk_rel:
           # TOMBSTONE: delete keys, remove sidecar, set tombstone
-          for (ei, w) in read slots/<i>.keys: dawg_delete_n(d, w\0 + i_be + ei_be)
+          for (ei, w) in read slots/<i>.keys: dafsa_delete_n(d, w\0 + i_be + ei_be)
           manifest[i] = tombstone entry
 
-  # Commit ORDER: (a) dawg_save → (b) sidecars → (c) manifest
-  dawg_save(d, index_dir/index.fst.tmp) → fsync → rename
+  # Commit ORDER: (a) dafsa_save → (b) sidecars → (c) manifest
+  dafsa_save(d, index_dir/index.fst.tmp) → fsync → rename
   write sidecars for changed/new; unlink sidecars for tombstoned
   write index_dir/manifest.json.tmp → fsync → rename
 ```
 
 ### 4.3 Crash-safety ordering
-DAWG save → sidecar writes → manifest write. A crash between (a)-(b) leaves new DAWG + old sidecar → self-heals on next `update` (no-op deletes, converge). Crash between (b)-(c) leaves new DAWG + new sidecars + old manifest → only risk is a transient duplicate slot for a newly-added file, healed by nightly `build`. Concurrent readers (search) read only `index.fst` + `manifest.json`, never the sidecar, so they're safe throughout.
+DAFSA save → sidecar writes → manifest write. A crash between (a)-(b) leaves new DAFSA + old sidecar → self-heals on next `update` (no-op deletes, converge). Crash between (b)-(c) leaves new DAFSA + new sidecars + old manifest → only risk is a transient duplicate slot for a newly-added file, healed by nightly `build`. Concurrent readers (search) read only `index.fst` + `manifest.json`, never the sidecar, so they're safe throughout.
 
 **Known limitation:** no WAL; full crash-consistency provided by nightly `build` compaction. (Stronger guarantee → add a `generation` file written last; deferred to post-M4, open question Q5.)
 
 ### 4.4 Error handling
 - Missing `index.fst` → fall back to `build` (first run). Corrupt `index.fst` → hard error (stderr + non-zero exit), recovered by compaction/manual `build`.
-- `dawg_delete_n` returning 0 (key absent) → warning, not fatal (orphan healing).
+- `dafsa_delete_n` returning 0 (key absent) → warning, not fatal (orphan healing).
 - Per-file extraction errors mirror `build`'s behavior (skip file's entries, emit empty slot).
 - Atomic writes: `.tmp` + `fsync` + `rename` for every file.
 
@@ -332,14 +337,14 @@ DAWG save → sidecar writes → manifest write. A crash between (a)-(b) leaves 
 
 `build` becomes initial + nightly compaction (dense, no tombstones, renumbers).
 
-- Drop `BTreeSet<Vec<u8>>` (keys). DAWG is order-independent (PoC Test 8) and `dawg_add_n` idempotent → no pre-sort/dedup of composite keys. Per-file `(entry_idx, word)` dedup via `HashSet` replaces it.
-- Drop `fst::SetBuilder`/`write_fst` → `dawg_save`.
+- Drop `BTreeSet<Vec<u8>>` (keys). DAFSA is order-independent (PoC Test 8) and `dafsa_add_n` idempotent → no pre-sort/dedup of composite keys. Per-file `(entry_idx, word)` dedup via `HashSet` replaces it.
+- Drop `fst::SetBuilder`/`write_fst` → `dafsa_save`.
 - Add sidecar writing (`output/slots/<idx>.keys`).
 - `FileEntry` gains `mtime`/`size`/`tombstoned` (build always writes `tombstoned:false`).
 - Atomic `.tmp`+`fsync`+`rename` for `index.fst` and `manifest.json`.
-- `report_size` reports DAWG size + manifest size + sidecar total.
+- `report_size` reports DAFSA size + manifest size + sidecar total.
 
-`Index::open` calls `Dawg::load` instead of `fst::Set::new`. `Index::search` uses `dawg_prefix_enum` per query word, collecting payloads into `HashSet`, then the **existing** AND/OR intersect-union / sort-by-(file_idx DESC, entry_idx ASC) / truncate logic is kept **verbatim**.
+`Index::open` calls `Dafsa::load` instead of `fst::Set::new`. `Index::search` uses `dafsa_prefix_enum` per query word, collecting payloads into `HashSet`, then the **existing** AND/OR intersect-union / sort-by-(file_idx DESC, entry_idx ASC) / truncate logic is kept **verbatim**.
 
 ---
 
@@ -349,14 +354,14 @@ DAWG save → sidecar writes → manifest write. A crash between (a)-(b) leaves 
 ```rust
 fn main() {
     cc::Build::new()
-        .file("c/dawg.c")
+        .file("c/dafsa.c")
         .include("c")
         .flag_if_supported("-std=c99")
         .warnings(true)
         .extra_warnings(true)
-        .compile("dawg");
-    println!("cargo:rerun-if-changed=c/dawg.c");
-    println!("cargo:rerun-if-changed=c/dawg.h");
+        .compile("dafsa");
+    println!("cargo:rerun-if-changed=c/dafsa.c");
+    println!("cargo:rerun-if-changed=c/dafsa.h");
 }
 ```
 The `cc` crate probes `$CC`, then `cc`, `gcc`, `clang`. It must NOT pick up cosmocc (cosmocc emits APE objects that won't link into a native Rust binary). Ensure a real `gcc`/`clang` is installed; set `CC=gcc` if needed. **Verify in M2 (Q2).**
@@ -365,16 +370,16 @@ The `cc` crate probes `$CC`, then `cc`, `gcc`, `clang`. It must NOT pick up cosm
 - Remove `fst = "0.4"`. Add `cc = "1"` (build-dependency). Keep `clap`, `serde`, `serde_json`, `anyhow`, `glob`, dev `tempfile`. Add `libc` only if needed for fsync (prefer `File::sync_all()`).
 
 ### 6.3 `src/ffi.rs` (new)
-`extern "C"` block declaring all `dawg_*` functions (see §1.1) + a safe `Dawg` wrapper:
-- `Dawg::create()`, `Dawg::load(path)`, `Dawg::save(path)`, `Dawg::add_n(&[u8])`, `Dawg::delete_n(&[u8])`, `Dawg::prefix_enum<F: FnMut(&[u8])>(&[u8])` (uses a stack trampoline passing the closure via `user` pointer), `Dawg::stats()`, `Drop` frees.
-- `#[repr(C)] struct DawgStatsOut { ... }`.
+`extern "C"` block declaring all `dafsa_*` functions (see §1.1) + a safe `Dafsa` wrapper:
+- `Dafsa::create()`, `Dafsa::load(path)`, `Dafsa::save(path)`, `Dafsa::add_n(&[u8])`, `Dafsa::delete_n(&[u8])`, `Dafsa::prefix_enum<F: FnMut(&[u8])>(&[u8])` (uses a stack trampoline passing the closure via `user` pointer), `Dafsa::stats()`, `Drop` frees.
+- `#[repr(C)] struct DafsaStatsOut { ... }`.
 - Not `Send`/`Sync` (CLI is single-threaded).
 
 ### 6.4 `Index::search` using `prefix_enum`
 ```rust
 for word in &query_words {
     let mut hits: HitSet = HitSet::new();
-    self.dawg.prefix_enum(word.as_bytes(), |payload| {
+    self.dafsa.prefix_enum(word.as_bytes(), |payload| {
         if payload.len() == 8 {
             let fi = u32::from_be_bytes(payload[0..4].try_into().unwrap());
             let ei = u32::from_be_bytes(payload[4..8].try_into().unwrap());
@@ -388,8 +393,8 @@ for word in &query_words {
 ```
 `prefix_enum("ca")` returns no payloads → `query "ca"` yields no `cat` hits (parity with `fst` startswith-break). **Add an explicit test for this.**
 
-### 6.5 `DawgView` (read-only, optional — defer to M4)
-A `DawgView` that loads only the compact CSR + final bitmap (no inode/register rebuild) for faster `Index::open`/search and lower memory. Not required for correctness.
+### 6.5 `DafsaView` (read-only, optional — defer to M4)
+A `DafsaView` that loads only the compact CSR + final bitmap (no inode/register rebuild) for faster `Index::open`/search and lower memory. Not required for correctness.
 
 ---
 
@@ -421,19 +426,19 @@ A `DawgView` that loads only the compact CSR + final bitmap (no inode/register r
 ### 8.1 `carrasco-forcada-poc/` (R&D testbed, cosmocc-built)
 | File | Action | What changes |
 |---|---|---|
-| `dawg.h` | CREATE | Public API header per §1.1. |
-| `dawg.c` | MODIFY (large) | Opaque `struct dawg`; heap arrays + grow; `_n` ops; load/save/prefix_enum/stats; BFS-renumber save; load materialize; remove `main()` (moves to `dawg_test.c`). |
-| `dawg_test.c` | CREATE | Old `main()` (tests 1-9) + round-trip, prefix W\0 semantics, embedded-NUL, randomized delete differential, enumeration correctness. |
-| `Makefile` | MODIFY | Build `dawg.c`+`dawg_test.c` with cosmocc; `test`; add `sync` target copying `dawg.{c,h}` → `fst-indexer/c/`. |
+| `dafsa.h` | CREATE | Public API header per §1.1. |
+| `dafsa.c` | MODIFY (large) | Opaque `struct dafsa`; heap arrays + grow; `_n` ops; load/save/prefix_enum/stats; BFS-renumber save; load materialize; remove `main()` (moves to `dafsa_test.c`). |
+| `dafsa_test.c` | CREATE | Old `main()` (tests 1-9) + round-trip, prefix W\0 semantics, embedded-NUL, randomized delete differential, enumeration correctness. |
+| `Makefile` | MODIFY | Build `dafsa.c`+`dafsa_test.c` with cosmocc; `test`; add `sync` target copying `dafsa.{c,h}` → `fst-indexer/c/`. |
 
 ### 8.2 `palimpsest/fst-indexer/`
 | File | Action | What changes |
 |---|---|---|
 | `Cargo.toml` | MODIFY | Remove `fst`, add `cc` build-dep. |
-| `build.rs` | CREATE | `cc` crate compiles `c/dawg.c`. |
-| `c/dawg.c`, `c/dawg.h` | CREATE (vendored) | Byte-identical to PoC source, synced via `make sync`. |
-| `src/ffi.rs` | CREATE | `extern "C"` + safe `Dawg` wrapper. |
-| `src/lib.rs` | MODIFY (large) | Drop fst; `Index { dawg, manifest }`; `FileEntry` +3 fields; rewrite `build`/`open`/`search`; new `update`; sidecar/atomic-write/composite_key helpers. |
+| `build.rs` | CREATE | `cc` crate compiles `c/dafsa.c`. |
+| `c/dafsa.c`, `c/dafsa.h` | CREATE (vendored) | Byte-identical to PoC source, synced via `make sync`. |
+| `src/ffi.rs` | CREATE | `extern "C"` + safe `Dafsa` wrapper. |
+| `src/lib.rs` | MODIFY (large) | Drop fst; `Index { dafsa, manifest }`; `FileEntry` +3 fields; rewrite `build`/`open`/`search`; new `update`; sidecar/atomic-write/composite_key helpers. |
 | `src/main.rs` | MODIFY | Add `Update` CLI variant. |
 
 ### 8.3 `palimpsest/unified-history-mcp/src/unified_history_mcp/`
@@ -459,12 +464,12 @@ A `DawgView` that loads only the compact CSR + final bitmap (no inode/register r
 
 ## 9. Testing strategy
 
-### 9.1 PoC C tests (`dawg_test.c`, `make test` with cosmocc)
+### 9.1 PoC C tests (`dafsa_test.c`, `make test` with cosmocc)
 - Existing 9 tests ported to the opaque API.
 - Round-trip: add N words → save → free → load → verify lookups + reachable counts.
-- Prefix semantics: `dawg_prefix_enum("cat")` returns cat payloads; `("ca")` and `("c")` return **zero**; `("cart")` returns cart payloads.
+- Prefix semantics: `dafsa_prefix_enum("cat")` returns cat payloads; `("ca")` and `("c")` return **zero**; `("cart")` returns cart payloads.
 - Embedded NUL via `_n`.
-- **Randomized delete differential** (load-bearing): for T trials, random universe of K random words; build via `dawg_add`; maintain a parallel `HashSet`; delete random subset; assert DAWG lookup == reference for every word; re-add random subset; assert again. Seeded for reproducibility.
+- **Randomized delete differential** (load-bearing): for T trials, random universe of K random words; build via `dafsa_add`; maintain a parallel `HashSet`; delete random subset; assert DAFSA lookup == reference for every word; re-add random subset; assert again. Seeded for reproducibility.
 - Enumeration correctness: for random prefixes, assert `prefix_enum` returns exactly the matching `prefix\0*` keys.
 
 ### 9.2 Cargo tests (`fst-indexer`, `cargo test`)
@@ -482,26 +487,26 @@ A `DawgView` that loads only the compact CSR + final bitmap (no inode/register r
 Point both binaries at the real sessions / web-archive dirs (per `~/.config/unified-history-mcp/config.toml`), build both, run the same battery, diff.
 
 ### 9.5 `MAX_STATES` measurement (required, Q1)
-After M2, run `target/release/fst-indexer build` on the real corpora and read `dawg_states_reachable` from summary JSON. Confirm comfortably below `DAWG_MAX_STATES_HARD`. If > ~5M states, revisit the dense `trans[256]` (2 KiB × 10M ≈ 20 GiB RAM).
+After M2, run `target/release/fst-indexer build` on the real corpora and read `dafsa_states_reachable` from summary JSON. Confirm comfortably below `DAFSA_MAX_STATES_HARD`. If > ~5M states, revisit the dense `trans[256]` (2 KiB × 10M ≈ 20 GiB RAM).
 
 ---
 
 ## 10. Phasing (M0..M4)
 
 ### M0 — C core refactor (heap + opaque + `_n` APIs)
-**Files:** `dawg.h` (new), `dawg.c` (refactor), `dawg_test.c` (new — old tests ported), `Makefile`.
-**Steps:** extract header; opaque struct; heap arrays + grow; `_n` ops (strlen wrappers delegate); `create`/`free`; move `main()` to `dawg_test.c`; port 9 tests; pointer-dangling audit.
+**Files:** `dafsa.h` (new), `dafsa.c` (refactor), `dafsa_test.c` (new — old tests ported), `Makefile`.
+**Steps:** extract header; opaque struct; heap arrays + grow; `_n` ops (strlen wrappers delegate); `create`/`free`; move `main()` to `dafsa_test.c`; port 9 tests; pointer-dangling audit.
 **Done when:** `make test` (cosmocc) passes 9 existing tests + new `_n` embedded-NUL test. save/load/prefix_enum are stubs returning -1.
 
-**STATUS: DONE (2026-08-06).** All 10 tests pass (verified via native ELF `dafsa.com.dbg` in-sandbox; APE `./dafsa` cannot fork under sandbox pledge but `.com.dbg` runs). `-Werror` clean. Reviewer found no blockers; pointer safety exemplary (all re-fetched by index across realloc). Applied reviewer SF3/SF4 NULL-safety guards to `dafsa_add_n`/`delete_n`/`lookup_n`. SF1 (register stale entries from merges) is pre-existing in original `dawg.c`, cleaned by M1's register-rebuild-on-load + nightly `build` — deferred, not a blocker. Files: `dafsa.h` (2916B), `dafsa.c` (31047B), `dafsa_test.c` (13464B), `Makefile` (324B). Old `dawg.c`/`dawg` preserved as reference. (Note: actual filenames use `dafsa` prefix, not the `dawg` prefix used in the original M0 spec.)
+**STATUS: DONE (2026-08-06).** All 10 tests pass (verified via native ELF `dafsa.com.dbg` in-sandbox; APE `./dafsa` cannot fork under sandbox pledge but `.com.dbg` runs). `-Werror` clean. Reviewer found no blockers; pointer safety exemplary (all re-fetched by index across realloc). Applied reviewer SF3/SF4 NULL-safety guards to `dafsa_add_n`/`delete_n`/`lookup_n`. SF1 (register stale entries from merges) is pre-existing in original `dawg.c`, cleaned by M1's register-rebuild-on-load + nightly `build` — deferred, not a blocker. Files: `dafsa.h` (2916B), `dafsa.c` (31047B), `dafsa_test.c` (13464B), `Makefile` (324B). Note: `dawg.c` was later removed (2026-08-06) and the repo standardized on `dafsa`; it remains in git history (ccba17b) for reference. (Note: actual filenames use `dafsa` prefix, not the `dawg` prefix used in the original M0 spec.)
 
 ### M1 — C persistence + prefix enumeration
-**Files:** `dawg.c` (save/load/prefix_enum/stats), `dawg_test.c` (round-trip, prefix, delete-differential).
-**Steps:** `dawg_save` (BFS-renumber, header, state table, final bitmap, CSR, atomic write); `dawg_load` (materialize, rebuild inodes, rebuild register); `dawg_prefix_enum`; `dawg_stats(out)`; tests.
+**Files:** `dafsa.c` (save/load/prefix_enum/stats), `dafsa_test.c` (round-trip, prefix, delete-differential).
+**Steps:** `dafsa_save` (BFS-renumber, header, state table, final bitmap, CSR, atomic write); `dafsa_load` (materialize, rebuild inodes, rebuild register); `dafsa_prefix_enum`; `dafsa_stats(out)`; tests.
 **Done when:** `make test` green; round-trip preserves lookup set across save/load for ≥10 trials of ≥1000 random keys; delete differential passes ≥50 trials; `prefix_enum` matches brute-force for ≥20 prefixes.
 
-### M2 — Rust FFI + `build`/`search` on DAWG, drop `fst` crate
-**Files:** `Cargo.toml`, `build.rs` (new), `c/dawg.{c,h}` (vendored via `make sync`), `src/ffi.rs` (new), `src/lib.rs` (rewrite build/open/search, drop fst), `src/main.rs` (unchanged CLI).
+### M2 — Rust FFI + `build`/`search` on DAFSA, drop `fst` crate
+**Files:** `Cargo.toml`, `build.rs` (new), `c/dafsa.{c,h}` (vendored via `make sync`), `src/ffi.rs` (new), `src/lib.rs` (rewrite build/open/search, drop fst), `src/main.rs` (unchanged CLI).
 **Steps:** `make sync`; add `cc` build-dep + build.rs; write `ffi.rs`; rewrite `build`/`open`/`search`; `cargo test`; verify native `cc` (Q2); run differential script on `/tmp` corpus.
 **Done when:** `cargo test` green (parity gate); native binary builds; differential vs live `fst-indexer` on `/tmp` = 0 mismatches across ≥100 queries.
 
@@ -510,9 +515,9 @@ After M2, run `target/release/fst-indexer build` on the real corpora and read `d
 **Steps:** extend `FileEntry`; sidecar read/write + `composite_key` + `atomic_write`; `Index::update` (§4.2/§4.3); `Update` CLI; cargo tests (update==build, modify/delete/add, tombstone stability, sidecar idempotency); Python changes; systemd timers.
 **Done when:** cargo `update` tests green; `update` then `search` matches fresh `build`'s search for same corpus; modify/delete/add update correctly with stable `file_idx`; Python `update_index` works end-to-end on a test domain; nightly compaction timer installed.
 
-### M4 — Hardening, real-corpus, headroom, optional `DawgView`
-**Files:** `scripts/diff_vs_live.sh`, `fst-indexer` (optional `DawgView`), docs/READMEs.
-**Steps:** real-corpus differential; `MAX_STATES` measurement; crash-consistency review (simulate kill -9 between commit phases); (optional) `DawgView` read-only fast path; (optional) switch web-archive `rebuild()` to `update`; update README/ROADMAP in both repos.
+### M4 — Hardening, real-corpus, headroom, optional `DafsaView`
+**Files:** `scripts/diff_vs_live.sh`, `fst-indexer` (optional `DafsaView`), docs/READMEs.
+**Steps:** real-corpus differential; `MAX_STATES` measurement; crash-consistency review (simulate kill -9 between commit phases); (optional) `DafsaView` read-only fast path; (optional) switch web-archive `rebuild()` to `update`; update README/ROADMAP in both repos.
 **Done when:** real-corpus differential clean; state-count recorded and within headroom; crash review documented; READMEs updated.
 
 ---
@@ -534,12 +539,12 @@ After M2, run `target/release/fst-indexer build` on the real corpora and read `d
 - **Q8:** serde field additions safe (Python ignores unknown keys; only Rust writes manifest).
 - **Q9:** FFI not thread-safe (single-threaded CLI fine).
 - **Q10:** `MAX_WORD_LEN` stack arrays fine (max composite key ≈ 109 bytes, well under 4096).
-- **Q11:** vendored C drift (`fst-indexer/c/dawg.c` vs PoC). Add a `cargo test` diff/hash check, or accept copy+sync model.
+- **Q11:** vendored C drift (`fst-indexer/c/dafsa.c` vs PoC). Add a `cargo test` diff/hash check, or accept copy+sync model.
 
 ---
 
 ## Key file locations (verified this session)
-- `dawg.c` — `/home/arch/projects/carrasco-forcada-poc/dawg.c` (832 lines, 9 tests, Makefile: cosmocc `-Wall -Wextra -Werror -O2`).
+- `dafsa.c` — `/home/arch/projects/carrasco-forcada-poc/dafsa.c` (opaque `dafsa` type, `dafsa_`-prefixed API; build with `dafsa.h` + `dafsa_test.c`, Makefile: cosmocc `-Wall -Wextra -Werror -O2`).
 - `fst-indexer` — `/home/arch/projects/palimpsest/fst-indexer/` (`Cargo.toml`: fst=0.4, clap4, serde, serde_json, anyhow, glob, dev tempfile; `main.rs` Build/Search CLI; `lib.rs`: build :81, open :147, search :167, payload decode :188, extract_jsonl :258, extract_txt :303, extract_transcript :333, parse_transcript :381, write_fst :453, write_manifest :465, collect_files :484, date_from_path :515, tokenize :543, tests :552).
 - `indexer.py` — `/home/arch/projects/palimpsest/unified-history-mcp/src/unified_history_mcp/indexer.py` (build_index :55, search_fst :118, _load_manifest :39, resolve_file_idx :153, _fix_dirs_manifest :101, _iter_domain_files :14).
 - `web-archive-mcp` — `/home/arch/projects/palimpsest/web-archive-mcp/src/web_archive_mcp/server.py:585-628` (`rebuild()` hardcodes `"fst-indexer"` at :602).
