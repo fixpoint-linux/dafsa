@@ -6,6 +6,8 @@ dawg
 # Compiled outputs
 *.elf
 *.dbg
+*.o
+*.so
 
 # Python site packages
 .py-site/
