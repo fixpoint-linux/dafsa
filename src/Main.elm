@@ -133,7 +133,7 @@ headerView =
             [ Fixpoint.Hero.hash
             , text " dafsa "
             , Fixpoint.Hero.dollar
-            , text " make"
+            , text " dhake"
             , Fixpoint.Hero.blink
             ]
         , title =
@@ -146,11 +146,13 @@ headerView =
             , text " clone-on-write + register + confluence — add and delete keys while keeping the machine minimal. A split "
             , b [] [ text "C11" ]
             , text " engine: length-delimited keys, an mmap zero-copy "
-            , b [] [ text "layered view"
-            ]
+            , b []
+                [ text "layered view"
+                ]
             , text ", and a "
-            , b [] [ text "write-ahead log"
-            ]
+            , b []
+                [ text "write-ahead log"
+                ]
             , text "."
             ]
         }
@@ -169,8 +171,9 @@ aboutSection =
         , children =
             [ p []
                 [ text "A DAFSA (also called a DAWG — directed acyclic word graph) is a minimized, deterministic, acyclic finite-state automaton that represents a set of strings/keys. Unlike a trie, shared suffixes are merged, so common prefixes "
-                , em [] [ text "and"
-                ]
+                , em []
+                    [ text "and"
+                    ]
                 , text " suffixes collapse into shared states, yielding a compact representation."
                 ]
             , p []
@@ -436,35 +439,34 @@ buildSection =
     Fixpoint.Section.view
         { id = "build"
         , title = "Build"
-        , hint = "// make → libdafsa.so · dhake → docs site"
+        , hint = "// dhake → libdafsa.so + docs site"
         , children =
             [ p []
-                [ text "The engine is built with "
-                , Fixpoint.Code.inline "make"
-                , text " into a shared "
+                [ text "Both the engine and the docs site are built with "
+                , a [ href "https://github.com/fixpoint-linux/dhake" ]
+                    [ text "dhake"
+                    ]
+                , text ": the C engine into a shared "
                 , Fixpoint.Code.inline "libdafsa.so"
-                , text ". The docs site is built with "
-                , a [ href "https://github.com/fixpoint-linux/dhake" ] [ text "dhake"
-                ]
-                , text " (an Elm app rendered against the Fixpoint design package)."
+                , text ", and the Elm app (rendered against the Fixpoint design package) into the docs site."
                 ]
             , Fixpoint.Code.block
                 [ Fixpoint.Code.k "$"
                 , text " "
-                , Fixpoint.Code.g "make"
-                , text "                  "
+                , Fixpoint.Code.g "./dhake/dhake.com libdafsa.so"
+                , text "  "
                 , Fixpoint.Code.c "# build libdafsa.so"
                 , text "\n"
                 , Fixpoint.Code.k "$"
                 , text " "
-                , Fixpoint.Code.g "make"
-                , text " clean            "
+                , Fixpoint.Code.g "./dhake/dhake.com clean"
+                , text "       "
                 , Fixpoint.Code.c "# remove objects + lib"
                 , text "\n"
                 , Fixpoint.Code.k "$"
                 , text " "
                 , Fixpoint.Code.g "./dhake/dhake.com"
-                , text "          "
+                , text "              "
                 , Fixpoint.Code.c "# build dist/index.html (docs site)"
                 ]
             ]

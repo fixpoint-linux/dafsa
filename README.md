@@ -58,9 +58,15 @@ bytes — a deliberate design requirement for the target use case.
 
 ## Building
 
+The build is driven by [dhake](https://github.com/fixpoint-linux/dhake)
+(`./dhake/dhake.com`, the vendored bootstrap binary). The default target builds
+the docs site; the engine is a named target.
+
 ```sh
-make        # builds libdafsa.so (shared)
-make clean
+./dhake/dhake.com               # build dist/index.html (docs site)
+./dhake/dhake.com libdafsa.so   # build the C engine (shared lib)
+./dhake/dhake.com clean         # remove objects + lib
+./dhake/dhake.com --list        # list targets
 ```
 
 Both consumers (`datalog-dafsa`, `jing-meta`) compile the engine objects from
@@ -82,7 +88,8 @@ this submodule and run their own test suites against them.
 | `dafsa_build.c`    | `dafsa_build_sorted` bulk minimal construction             |
 | `dafsa_rank.c`     | rank / rank_from queries                                   |
 | `dafsa_view_rank.c`| rank over a read-only view                                 |
-| `Makefile`         | `build` / `clean`                                          |
+| `Dhakefile.dhall` | dhake buildfile (`libdafsa.so` / `clean` / docs site)          |
+| `dhake/dhake.com` | vendored dhake bootstrap binary (the build driver)             |
 
 ## Usage example
 
