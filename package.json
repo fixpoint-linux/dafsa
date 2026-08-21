@@ -1,0 +1,31 @@
+{
+    "name": "dafsa",
+    "version": "1.0.0",
+    "description": "**dafsa** is the Carrasco–Forcada incremental minimal-acyclic DFA (DAFSA/DAWG) engine in C11: length-delimited keys, an mmap zero-copy view, and a write-ahead log. Consumed as a git submodule by datalog-dafsa and jing-meta. Docs site built with Elm + mfe-framework.",
+    "main": "index.js",
+    "directories": {
+        "doc": "dist"
+    },
+    "scripts": {
+        "build": "./dhake/dhake.com dist/index.html"
+    },
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/fixpoint-linux/dafsa.git"
+    },
+    "keywords": [],
+    "type": "module",
+    "bugs": {
+        "url": "https://github.com/fixpoint-linux/dafsa/issues"
+    },
+    "homepage": "https://github.com/fixpoint-linux/dafsa#readme",
+    "devDependencies": {
+        "elm": "^0.19.2-0",
+        "elm-format": "^0.8.8",
+        "happy-dom": "^20.11.6"
+    },
+    "allowScripts": {
+        "elm@0.19.2-0": true,
+        "elm-format@0.8.8": true
+    }
+}

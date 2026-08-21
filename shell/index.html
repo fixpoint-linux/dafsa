@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>dafsa — the Carrasco–Forcada incremental DAFSA</title>
+<meta name="description" content="dafsa: the Carrasco–Forcada incremental DAFSA engine — clone-on-write, a state register, and confluence. A split C11 engine: length-delimited keys, an mmap zero-copy view, and a write-ahead log. Consumed by datalog-dafsa and jing-meta.">
+<script type="importmap">
+{
+  "imports": {
+    "@mfe/core": "./vendor/@mfe/core/index.js",
+    "@mfe/framework": "./vendor/@mfe/framework/index.js",
+    "dafsa-page": "./shell/mfe/dafsa-page.js",
+    "fixpoint-landing": "/shell/mfe/fixpoint-landing.js"
+  }
+}
+</script>
+</head>
+<body>
+<div id="app" ssr>
+  <div class="fixpoint-root">
+    <div data-mfe="dafsa-page"><!-- ssg.mjs injects the pre-rendered dafsa page markup here --></div>
+  </div>
+</div>
+<script type="module" src="./shell/shell.js"></script>
+</body>
+</html>

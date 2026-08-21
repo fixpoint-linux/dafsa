@@ -1,0 +1,6 @@
+[submodule "design"]
+	path = design
+	url = https://github.com/fixpoint-linux/design.git
+[submodule "mfe-framework"]
+	path = mfe-framework
+	url = https://github.com/fixpoint-linux/mfe-framework.git

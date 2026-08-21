@@ -11,3 +11,9 @@ dawg
 
 # Python site packages
 .py-site/
+
+# Elm + MFE site build artifacts
+node_modules/
+elm-stuff/
+dist/
+vendor/@mfe/
