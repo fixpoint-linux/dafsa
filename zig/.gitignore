@@ -1,0 +1,11 @@
+# Zig differential-harness build artifacts (generated, do not commit)
+/crc32_c_driver
+/crc32_zig_driver
+/minimal
+*.o
+/zig-cache/
+/zig-out/
+# scratch probes from coder's stdlib debugging (not part of the harness)
+/minimal.zig
+/read_stdin*.zig
+/test_io.zig
