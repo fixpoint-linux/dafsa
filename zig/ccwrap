@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# ccwrap — flag surgery: swap the C vendor/dafsa .o set for the Zig libdafsa.so
+#  compile steps pass through untouched
+#  link steps drop -static + the vendor/dafsa/*.o objects, append -L<ziglib> -ldafsa -Wl,-rpath
+set -euo pipefail
+ZIGLIB=/workspace/carrasco-forcada-poc/zig/lib
+
+has_o=0
+has_dashc=0
+for a in "$@"; do
+  case "$a" in
+    -c) has_dashc=1 ;;
+    *.o) has_o=1 ;;
+  esac
+done
+is_link=0
+if [ "$has_o" = "1" ] && [ "$has_dashc" = "0" ]; then
+  is_link=1
+fi
+
+if [ "$is_link" = "1" ]; then
+  OUT=()
+  for a in "$@"; do
+    case "$a" in
+      -static) continue ;;
+      */vendor/dafsa/*.o) continue ;;
+    esac
+    OUT+=("$a")
+  done
+  OUT+=("-L$ZIGLIB" "-ldafsa" "-Wl,-rpath,$ZIGLIB")
+  exec cc "${OUT[@]}"
+else
+  exec cc "$@"
+fi

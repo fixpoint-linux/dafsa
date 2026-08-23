@@ -1,0 +1,12 @@
+create
+load good.pdwg
+load trunc.pdwg
+load badmagic.pdwg
+load badcrc.pdwg
+load empty.pdwg
+loadro good.pdwg
+loadro trunc.pdwg
+loadro badmagic.pdwg
+loadro badcrc.pdwg
+loadro empty.pdwg
+free

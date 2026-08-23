@@ -1,0 +1,54 @@
+create
+buildbegin
+bkey 61
+bkey 6162
+bkey 616263
+bkey 616264
+bkey 6163
+bkey 6164
+bkey 62
+bkey 6263
+bkey 626364
+bkey 6265
+bkey 63
+buildend
+stats
+lookup 61
+lookup 6162
+lookup 616263
+lookup 616264
+lookup 6163
+lookup 6164
+lookup 62
+lookup 6263
+lookup 626364
+lookup 6265
+lookup 63
+lookup 646566
+free
+create
+add 626364
+add 616264
+add 6162
+add 63
+add 61
+add 6263
+add 6163
+add 616263
+add 62
+add 6164
+add 6265
+stats
+lookup 61
+lookup 6162
+lookup 616263
+lookup 616264
+lookup 6163
+lookup 6164
+lookup 62
+lookup 6263
+lookup 626364
+lookup 6265
+lookup 63
+lookup 646566
+free

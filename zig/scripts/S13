@@ -1,0 +1,69 @@
+create
+add 61
+add 6162
+add 616263
+add 616264
+add 6163
+add 62
+add 6263
+add 6264
+add 63
+add 6300
+stats
+rank 61
+rank 6163
+rank 6164
+rank 616265
+rank 6265
+rank 00
+rank 6301
+rank ff
+select 0
+select 1
+select 2
+select 3
+select 4
+select 5
+select 8
+select 9
+select 10
+select 99
+rancount 61 62
+rancount 6162 616264
+rancount 00 62
+rancount ff 00
+rancount 6163 6163
+fromstate 61
+rank 62
+rank 6300
+rank 64
+select 0
+select 2
+select 5
+rancount 62 63
+rancount 63 ff
+fromstate 00
+rank 00
+fromstate 6162
+rank 63
+rank 64
+select 0
+select 1
+rancount 6163 616264
+fromstate 99
+rank 00
+select 0
+save s13.pdwg
+vopen s13.pdwg
+vrank 6163
+vrank 6265
+vrank 6301
+vrank ff
+vselect 0
+vselect 3
+vselect 9
+vselect 99
+vrancount 61 62
+vrancount 00 ff
+vclose
+free

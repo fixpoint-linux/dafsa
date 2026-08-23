@@ -1,0 +1,21 @@
+create
+add 610062
+add 610063
+add 61006200
+lookup 610062
+lookup 610063
+lookup 61006200
+lookup 6100
+stats
+del 610062
+lookup 610062
+lookup 610063
+stats
+add 610062
+lookup 610062
+stats
+del 61006200
+lookup 61006200
+lookup 610062
+stats
+free

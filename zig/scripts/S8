@@ -1,0 +1,32 @@
+create
+add 61
+add 6162
+add 616263
+add 62
+add 6261
+stats
+lookup 61
+lookup 6162
+del 616263
+lookup 616263
+lookup 6162
+stats
+add 626263
+add 626264
+del 6261
+stats
+lookup 626263
+del 61
+del 6162
+stats
+add 61
+lookup 61
+stats
+del 62
+del 626263
+del 626264
+stats
+add 62
+add 6261
+stats
+free

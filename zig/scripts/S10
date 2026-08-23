@@ -1,0 +1,50 @@
+create
+buildbegin
+bkey 61
+bkey 6162
+bkey 616263
+bkey 616264
+bkey 6163
+bkey 6164
+bkey 62
+bkey 6263
+bkey 626364
+bkey 6265
+bkey 63
+buildend
+stats
+lookup 616263
+lookup 646566
+save s1.pdwg
+load s1.pdwg
+stats
+lookup 61
+lookup 626364
+add 6165
+del 63
+stats
+save s2.pdwg
+load s2.pdwg
+stats
+lookup 6165
+lookup 63
+add 64
+del 61
+save s3.pdwg
+loadro s3.pdwg
+stats
+lookup 6162
+lookup 63
+free
+create
+add 646566
+add 646567
+add 646568
+add 6465
+stats
+save s4.pdwg
+loadro s4.pdwg
+stats
+lookup 646567
+lookup 646569
+free
