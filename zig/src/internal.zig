@@ -17,7 +17,7 @@ const std = @import("std");
 
 // ─── Tunables (dafsa_internal.h:24-30) ──────────────────────────────────────
 pub const DAFSA_MAX_STATES_HARD: u32 = 100_000_000;
-pub const MAX_WORD_LEN: usize = 4096;
+pub const MAX_WORD_LEN: usize = 65536;
 pub const ALPHABET_SZ: u32 = 256;
 pub const FNV_OFFSET: u64 = 14695981039346656037;
 pub const FNV_PRIME: u64 = 1099511628211;

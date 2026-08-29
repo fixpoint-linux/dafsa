@@ -45,8 +45,8 @@ const Dafsa = internal.Dafsa;
 // For a MINIMIZED DAG this is memoized bottom-up; a state shared by N parents
 // contributes its count to each parent edge, which is CORRECT (each parent edge
 // is a distinct symbol => disjoint key sets). count(s) = is_final(s) + sum over
-// outgoing transitions of count(target). Recursion depth <= MAX_WORD_LEN (4096),
-// safe on the C stack.
+// outgoing transitions of count(target). Recursion is over the DAG state graph
+// (one frame per state), so depth is bounded by n_states, not by key length.
 fn countRecurse(d: *const Dafsa, s: u32, memo: []u64, visiting: []u8) u64 {
     const st = &d.states[s];
     if (visiting[s] != 0) return memo[s]; // DAG revisit: already computed

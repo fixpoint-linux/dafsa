@@ -24,7 +24,7 @@ const linux = std.os.linux;
 const crc32 = @import("crc32.zig");
 const internal = @import("internal.zig");
 
-const MAX_KEY_LEN: usize = internal.MAX_WORD_LEN + 9; // 4105
+const MAX_KEY_LEN: usize = internal.MAX_WORD_LEN + 9; // 65545
 
 const DAFSA_WAL_OP_ADD: u8 = 1;
 const DAFSA_WAL_OP_DEL: u8 = 2;

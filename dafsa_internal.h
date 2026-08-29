@@ -22,7 +22,9 @@
 /* ─── Tunables ──────────────────────────────────────────────────────────── */
 
 #define DAFSA_MAX_STATES_HARD  100000000
-#define MAX_WORD_LEN           4096
+/* Must exceed the longest interned symbol: real content symbols reach
+ * 33311 bytes, and 65536 (2^16) gives ~2x margin.  Keep a power of two. */
+#define MAX_WORD_LEN           65536
 #define ALPHABET_SZ            256
 #define FNV_OFFSET             14695981039346656037ULL
 #define FNV_PRIME              1099511628211ULL
