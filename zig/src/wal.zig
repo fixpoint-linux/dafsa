@@ -34,7 +34,11 @@ const DAFSA_WAL_OP_DEL: u8 = 2;
 pub const ReplayCb = *const fn (op: u8, key: []const u8, user: ?*anyopaque) i32;
 
 // Opaque WAL handle (dafsa_internal.h:119): `struct dafsa_wal { int fd; uint64_t size; }`.
-pub const Wal = struct {
+// extern struct: consumers (datalog-dafsa rel_compact) read ->fd / ->size
+// directly off the handle returned by dafsa_wal_open*, so the field offsets
+// MUST match the C struct (fd@0, size@8).  A plain `struct` lets Zig reorder
+// the fields (size@0, fd@8), which silently corrupts ftruncate(w->fd, ...).
+pub const Wal = extern struct {
     fd: i32,
     size: u64,
 };
