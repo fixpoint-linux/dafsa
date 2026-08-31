@@ -1,17 +1,23 @@
 -- Dhakefile.dhall — build the dafsa engine and docs site with dhake.
 --
--- Both the C engine (`libdafsa.so`, formerly the Makefile) and the docs site
--- (fixpointlinux.org/dafsa) are driven by this single buildfile. The site is
--- an Elm app (src/Main.elm) rendered against the shared Fixpoint.* design
--- package (the `design` submodule) plus the mfe-framework submodule,
--- pre-rendered by scripts/ssg.mjs to static dist/.
+-- The dafsa engine is now Zig (zig/src; verified by zig/dafsa_diff.sh). This
+-- buildfile drives the docs site (fixpointlinux.org/dafsa). The site is an Elm
+-- app (src/Main.elm) rendered against the shared Fixpoint.* design package
+-- (the `design` submodule) plus the mfe-framework submodule, pre-rendered by
+-- scripts/ssg.mjs to static dist/.
+--
+-- Non-phony targets pin `hash` (expected output) and `depsHash` (expected
+-- source dep) SHA-256s for verified builds — see the dhake README "Verified
+-- builds". `--verify` pre-flights all pinned hashes; `--lock` writes a
+-- lockfile; `--hash-uptodate` decides up-to-dateness by content, not mtime.
 --
 --   ./dhake/dhake.com                    # default target: dist/index.html (site)
---   ./dhake/dhake.com libdafsa.so        # build the C engine (shared lib)
---   ./dhake/dhake.com clean              # remove objects + lib
+--   ./dhake/dhake.com clean              # remove artifacts
+--   ./dhake/dhake.com --verify           # CI pre-flight: check pinned hashes
 --   ./dhake/dhake.com --list             # list targets
 --
--- dhake.com is the vendored bootstrap binary (committed); the build driver.
+-- dhake itself is a git submodule (dhake/); dhake/dhake.com is the committed
+-- bootstrap binary. `dhake.com` in the usage lines is `./dhake/dhake.com`.
 
 let Action =
       < Shell : Text
@@ -58,29 +64,18 @@ in  { targets =
           , mapValue =
               { deps = [ "src/Main.elm", "elm.json", "design/src" ]
               , phony = False
+              -- expected hash of the produced dist/elm.js (verified after build).
+              -- elm 0.19.2 --optimize output is byte-deterministic for identical
+              -- inputs, so this pins the artifact. `design/src` is a directory
+              -- and cannot be file-hashed, so it is pinned transitively via this
+              -- output hash (any change to it changes the elm.js bytes).
+              , hash = "sha256:8c111af3b4a7e49b4931dfee0041c96b6377eca5a5c8eb168a62c0bb571d0eff"
+              , depsHash =
+                  [ { path = "src/Main.elm", hash = "sha256:a8a454b680caae24b2ef78b60321132ac91125de200131bb14d14967b22bbdae" }
+                  , { path = "elm.json", hash = "sha256:7a645a6d4458599521f1340b725e15795fcf43187c0c3fdff078e4bade962d5e" }
+                  ]
               , recipe =
                   [ < Shell = "node_modules/elm/bin/elm make src/Main.elm --output=dist/elm.js --optimize" > ]
-              }
-          }
-        , { mapKey = "libdafsa.so"
-          , mapValue =
-              { deps =
-                  [ "dafsa.c"
-                  , "dafsa_state.c"
-                  , "dafsa_core.c"
-                  , "dafsa_persist.c"
-                  , "dafsa_view.c"
-                  , "dafsa_crc32.c"
-                  , "dafsa_wal.c"
-                  , "dafsa_build.c"
-                  , "dafsa_rank.c"
-                  , "dafsa_view_rank.c"
-                  ]
-              , phony = False
-              , recipe =
-                  [ < Shell = "gcc -O2 -Wall -Wextra -Werror -std=c11 -fPIC -D_POSIX_C_SOURCE=200809L -I. -c dafsa.c dafsa_state.c dafsa_core.c dafsa_persist.c dafsa_view.c dafsa_crc32.c dafsa_wal.c dafsa_build.c dafsa_rank.c dafsa_view_rank.c" >
-                  , < Shell = "gcc -shared -fPIC -O2 -Wall -Wextra -Werror -std=c11 -fPIC -D_POSIX_C_SOURCE=200809L -I. -o libdafsa.so dafsa.o dafsa_state.o dafsa_core.o dafsa_persist.o dafsa_view.o dafsa_crc32.o dafsa_wal.o dafsa_build.o dafsa_rank.o dafsa_view_rank.o" >
-                  ]
               }
           }
         , { mapKey = "clean"
@@ -89,7 +84,6 @@ in  { targets =
               , phony = True
               , recipe =
                   [ < Rm = { path = "libdafsa.so", recursive = False } >
-                  , < Shell = "rm -f dafsa.o dafsa_state.o dafsa_core.o dafsa_persist.o dafsa_view.o dafsa_crc32.o dafsa_wal.o dafsa_build.o dafsa_rank.o dafsa_view_rank.o" >
                   ]
               }
           }
@@ -104,6 +98,17 @@ in  { targets =
                   , "scripts/ssg.mjs"
                   ]
               , phony = False
+              -- expected hash of the produced dist/index.html (verified after
+              -- build). The ssg output is byte-deterministic for identical
+              -- inputs. `dist/elm.js` (a target) and `vendor-mfe` (phony,
+              -- multi-file) are verified transitively via this output hash.
+              , hash = "sha256:f7c4180bfd20218a42ca8b35ef814b19022db94a703e530c4620e587780268f4"
+              , depsHash =
+                  [ { path = "shell/index.html", hash = "sha256:4b86056e243b1bba7af0ebc0287db712cb2f8588717a055e9ba4513529bdddcc" }
+                  , { path = "shell/shell.js", hash = "sha256:71360de5795fa9a9e7d3d5549e18625415a2bed5c5eb34c6f61a6b6ed59f8463" }
+                  , { path = "shell/templates/dafsa.html", hash = "sha256:06d0b13a0ecf6c43e4a2e04ce6a711fdf7fac446c360a4d7f7efaea60a694ec4" }
+                  , { path = "scripts/ssg.mjs", hash = "sha256:97a3e03492ae475fb50f13a7841f62ec47a1c724d57b8605e88e4cb07d10c6e5" }
+                  ]
               , recipe = [ < Shell = "node scripts/ssg.mjs" > ]
               }
           }
