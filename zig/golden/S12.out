@@ -1,0 +1,12 @@
+= create 1
+= load 1
+= load 0
+= load 0
+= load 0
+= load 0
+= loadro 1
+= loadro 0
+= loadro 0
+= loadro 0
+= loadro 0
+= free 1

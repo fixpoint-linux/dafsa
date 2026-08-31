@@ -1,0 +1,17 @@
+= create 1
+= add 1
+= lookup 0
+= error NOTIMPL
+= add -1
+= error NOTIMPL
+= lookup 0
+= error NOTIMPL
+= add -1
+= error NOTIMPL
+= error NOTIMPL
+= add -1
+= error NOTIMPL
+= error NOTIMPL
+= del 1
+= stats 2046 2046 0 2045 6
+= free 1

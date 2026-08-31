@@ -1,0 +1,29 @@
+= create 1
+= add 1
+= add 1
+= add 1
+= save 0
+= wopen 1
+= wadd 0
+= wadd 0
+= wdel 0
+= wsize 73
+= wreplay 3
+1 61000000000000000003
+1 61000000000000000001
+2 62000000000000000001
+= wclose
+= lopen 1
+= vlookup 1
+= vlookup 1
+= vlookup 1
+= vlookup 0
+= vlookup 0
+= vlookup 0
+= vprefix 3
+0000000000000001
+0000000000000002
+0000000000000003
+= vprefix 0
+= vclose
+= free 1
