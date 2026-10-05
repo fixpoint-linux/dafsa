@@ -71,9 +71,20 @@ pub const State = extern struct {
 };
 
 comptime {
-    if (@sizeOf(State) != 64) @compileError("State must be exactly one cache line (64B)");
-    if (@offsetOf(State, "trans") + DAFSA_INLINE_N * @sizeOf(Edge) > 64)
-        @compileError("inline edges must fit in cache line");
+    // The cache-line sizing is an LP64 property, not a universal one: the C
+    // oracle's own `_Static_assert(sizeof(State) == 64)` FAILS on i386 (its
+    // `TransHeap *trans_heap` is 4 bytes there, so State is 60 and `trans`
+    // lands at 28) — the engine cannot even be compiled 32-bit by the original
+    // C.  MEASURED both ways from vendor/dafsa_internal.h with `zig cc`:
+    //   x86_64  sizeof 64, trans @32  (the one-cache-line design)
+    //   i386    sizeof 60, trans @28
+    // What must hold on EVERY target is that the inline edges fit and that this
+    // engine State stays byte-identical to the abi mirror (dafsa_c.State).
+    const want: usize = if (@sizeOf(usize) == 8) 64 else 60;
+    if (@sizeOf(State) != want)
+        @compileError("State layout drift: sizeof mismatch (expected 64 on LP64, 60 on ILP32)");
+    if (@offsetOf(State, "trans") + DAFSA_INLINE_N * @sizeOf(Edge) > @sizeOf(State))
+        @compileError("inline edges must fit in State");
 }
 
 // ─── Dafsa handle (dafsa_internal.h:76-115) ────────────────────────────────

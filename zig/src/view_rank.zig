@@ -19,7 +19,7 @@ fn viewIsFinal(v: *const DafsaView, s: u32) bool {
 fn viewCountRecurse(v: *const DafsaView, s: u32, memo: []u64, computed: []u8) u64 {
     if (computed[s] != 0) return memo[s];
     var c: u64 = if (viewIsFinal(v, s)) 1 else 0;
-    var cur: []const u8 = v.csr[v.state_off[s]..v.state_off[s + 1]];
+    var cur: []const u8 = v.csr[@intCast(v.state_off[s])..@intCast(v.state_off[s + 1])];
     var sym: u8 = undefined;
     var tgt: u32 = undefined;
     while (view.viewEdgeNext(v, s, &cur, &sym, &tgt) == 0) {
@@ -55,7 +55,7 @@ fn viewRankCore(v: *const DafsaView, s: u32, counts: []const u64, key: []const u
     var cur_s = s;
     for (key) |c| {
         if (viewIsFinal(v, cur_s)) r +%= 1;
-        var cur: []const u8 = v.csr[v.state_off[cur_s]..v.state_off[cur_s + 1]];
+        var cur: []const u8 = v.csr[@intCast(v.state_off[cur_s])..@intCast(v.state_off[cur_s + 1])];
         var sym: u8 = undefined;
         var tgt: u32 = undefined;
         var matched = false;
@@ -96,7 +96,7 @@ fn viewSelectCore(v: *const DafsaView, s: u32, counts: []const u64, k: u64, key_
             if (kk == 0) return @intCast(pos);
             kk -%= 1;
         }
-        var cur: []const u8 = v.csr[v.state_off[cur_s]..v.state_off[cur_s + 1]];
+        var cur: []const u8 = v.csr[@intCast(v.state_off[cur_s])..@intCast(v.state_off[cur_s + 1])];
         var sym: u8 = undefined;
         var tgt: u32 = undefined;
         var descended = false;

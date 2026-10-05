@@ -130,10 +130,21 @@ pub const CViewFacade = extern struct {
 };
 
 comptime {
-    if (@offsetOf(CFacade, "impl") != 152)
-        @compileError("CFacade must match struct dafsa layout (impl must land at C sizeof 152)");
-    if (@offsetOf(CViewFacade, "impl") != 56)
-        @compileError("CViewFacade must match struct dafsa_view layout (impl must land at C sizeof 56)");
+    // `impl` is appended PAST the C struct, so it must land on the C
+    // sizeof(struct dafsa) / sizeof(struct dafsa_view) — both width-dependent
+    // (pointers and size_t).  MEASURED from the C oracle vendor/dafsa_internal.h
+    // (extracted from git history) with `zig cc`:
+    //   x86_64: sizeof(struct dafsa) = 152,  sizeof(struct dafsa_view) = 56
+    //   i386:   sizeof(struct dafsa) =  84,  sizeof(struct dafsa_view) = 32
+    const lp64 = @sizeOf(usize) == 8;
+    const want_dafsa: usize = if (lp64) 152 else 84;
+    const want_view: usize = if (lp64) 56 else 32;
+    if (@offsetOf(CFacade, "impl") != want_dafsa)
+        @compileError("CFacade must match struct dafsa layout (impl must land at C sizeof dafsa)");
+    if (@offsetOf(CViewFacade, "impl") != want_view)
+        @compileError("CViewFacade must match struct dafsa_view layout (impl must land at C sizeof dafsa_view)");
+    // State's own cache-line sizing is pinned in internal.zig (64 on LP64,
+    // 60 on ILP32 — the C _Static_assert for 64 fails on i386).
 }
 
 fn syncDafsa(f: *CFacade) void {
@@ -339,7 +350,7 @@ export fn dafsa_prefix_enum(
         t_enum_cb = saved_cb;
         t_enum_user = saved_user;
     }
-    return view_mod.dafsaPrefixEnum(dd, pfx, enumTrampoline, null);
+    return @intCast(view_mod.dafsaPrefixEnum(dd, pfx, enumTrampoline, null));
 }
 
 // ─── Persistence (dafsa.h:37-39) ────────────────────────────────────────────
@@ -446,7 +457,7 @@ export fn dafsa_view_prefix_enum(
         t_enum_cb = saved_cb;
         t_enum_user = saved_user;
     }
-    return view_mod.dafsaViewPrefixEnum(vv, pfx, enumTrampoline, null);
+    return @intCast(view_mod.dafsaViewPrefixEnum(vv, pfx, enumTrampoline, null));
 }
 
 export fn dafsa_view_open_layered(fst_path: [*c]const u8, wal_path: [*c]const u8) ?*CViewFacade {

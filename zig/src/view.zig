@@ -559,8 +559,8 @@ pub fn dafsaPrefixEnum(d: *const Dafsa, prefix: []const u8, cb: EnumCb, user: ?*
 // ─── Zero-copy view read helpers ───────────────────────────────────────────
 
 pub fn viewTransFind(v: *const DafsaView, s: u32, sym: u8, target_out: *u32) i32 {
-    const state_start = v.state_off[s];
-    const state_end = v.state_off[s + 1];
+    const state_start = @as(usize, @intCast(v.state_off[s]));
+    const state_end = @as(usize, @intCast(v.state_off[s + 1]));
     var p: []const u8 = v.csr[state_start..state_end];
     while (p.len > 0) {
         const e_sym = p[0];
@@ -585,7 +585,7 @@ fn mbSkipVarint(cursor: *[]const u8) i32 {
 }
 
 pub fn viewEdgeNext(v: *const DafsaView, s: u32, cursor: *[]const u8, sym_out: *u8, target_out: *u32) i32 {
-    const state_end = v.state_off[s + 1];
+    const state_end = @as(usize, @intCast(v.state_off[s + 1]));
     _ = state_end;
     if (cursor.*.len == 0) return -1;
     if (!persist.mb_get_u8(cursor, sym_out)) return -1;
@@ -602,7 +602,7 @@ pub fn viewEnumDfs(v: *const DafsaView, state_id: u32, buf: []u8, depth: usize, 
         if (cb(buf[0..depth], user) != 0) return 1;
     }
     if (depth >= MAX_WORD_LEN) return 0;
-    var cur: []const u8 = v.csr[v.state_off[state_id]..v.state_off[state_id + 1]];
+    var cur: []const u8 = v.csr[@intCast(v.state_off[state_id])..@intCast(v.state_off[state_id + 1])];
     var sym: u8 = undefined;
     var tgt: u32 = undefined;
     while (viewEdgeNext(v, state_id, &cur, &sym, &tgt) == 0) {
@@ -641,7 +641,7 @@ fn viewEnumDfsLayered(v: *const DafsaView, state_id: u32, buf: []u8, depth: usiz
     }
 
     if (depth >= MAX_WORD_LEN) return 0;
-    var cur: []const u8 = v.csr[v.state_off[state_id]..v.state_off[state_id + 1]];
+    var cur: []const u8 = v.csr[@intCast(v.state_off[state_id])..@intCast(v.state_off[state_id + 1])];
     var sym: u8 = undefined;
     var tgt: u32 = undefined;
     while (viewEdgeNext(v, state_id, &cur, &sym, &tgt) == 0) {
