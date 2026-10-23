@@ -313,6 +313,57 @@ run_golden "S13 rank/select/rancount + _from + view rank" scripts/S13 S13.out
   run_golden "S13-scale rank/select/rancount (400-key corpus)" "$SCRIPT" S13scale.out
 }
 
+# ─── S14 legacy file: a .pdwg written by a PREVIOUS engine build ────────────
+# golden/legacy-v4.pdwg was written by the engine at fd4648d, before the
+# view-open rework, for the corpus in src/view.zig's tests: 204 reachable
+# states, 403 transitions, 1- and 2-byte varint targets, a 200-deep chain,
+# embedded NULs and the empty key.  It pins two things a format/reader change
+# must not break: (1) an existing on-disk file still opens and answers exactly
+# as a re-save of it does, and (2) a state-dense corpus (6 bytes of CSR per
+# state) gets NO persisted offset table — the writer's measured threshold is
+# table <= csr/2, so re-saving this file upgrades the header to v5 but adds no
+# table and changes no other byte count.
+{
+  rm -rf "$WORK"; mkdir -p "$WORK"
+  cp "$GOLDEN_DIR/legacy-v4.pdwg" "$WORK/legacy.pdwg"
+  {
+    echo "vopen legacy.pdwg"
+    echo "vlookup 6100"; echo "vlookup 610063"; echo "vlookup 610162"
+    echo "vlookup 6101"; echo "vlookup 61c8"; echo "vlookup 61ff"; echo "vlookup 6b"
+    echo "vprefix 61"; echo "vprefix 6100"; echo "vprefix 7a"
+    echo "vclose"
+    echo "create"
+    echo "load legacy.pdwg"
+    echo "stats"
+    echo "save upgraded.pdwg"
+    echo "free"
+    echo "vopen upgraded.pdwg"
+    echo "vlookup 6100"; echo "vlookup 610063"; echo "vlookup 610162"
+    echo "vlookup 6101"; echo "vlookup 61c8"; echo "vlookup 61ff"; echo "vlookup 6b"
+    echo "vprefix 61"; echo "vprefix 6100"; echo "vprefix 7a"
+    echo "vclose"
+    echo "free"
+  } > "$SCRIPT"
+  ./$ZIG_DRIVER "$WORK" < "$SCRIPT" > "$ZIG_OUT"
+  LEGACY_BYTES=$(wc -c < "$WORK/legacy.pdwg")
+  UP_BYTES=$(wc -c < "$WORK/upgraded.pdwg" 2>/dev/null || echo 0)
+  UPVER=$(od -An -tu1 -j4 -N1 "$WORK/upgraded.pdwg" 2>/dev/null | tr -d ' \n')
+  UPFLAGS=$(od -An -tu1 -j24 -N1 "$WORK/upgraded.pdwg" 2>/dev/null | tr -d ' \n')
+  if [ "${RECORD_GOLDEN:-0}" = "1" ]; then
+    mkdir -p "$GOLDEN_DIR"
+    cp "$ZIG_OUT" "$GOLDEN_DIR/S14legacy.out"
+    echo "RECORDED: S14 legacy file -> $GOLDEN_DIR/S14legacy.out"
+  elif cmp -s "$ZIG_OUT" "$GOLDEN_DIR/S14legacy.out" \
+       && [ "$UPVER" = "5" ] && [ "$UPFLAGS" = "0" ] && [ "$UP_BYTES" = "$LEGACY_BYTES" ]; then
+    echo "PASS: S14 legacy file opens + re-saves as v5 with no table ($LEGACY_BYTES bytes)"
+    PASS_COUNT=$((PASS_COUNT + 1))
+  else
+    echo "FAIL: S14 legacy file diverged (legacy $LEGACY_BYTES bytes, re-saved $UP_BYTES, version=$UPVER flags=$UPFLAGS)"
+    diff "$GOLDEN_DIR/S14legacy.out" "$ZIG_OUT" || true
+    FAIL_COUNT=$((FAIL_COUNT + 1)); exit 1
+  fi
+}
+
 # ─── Summary ────────────────────────────────────────────────────────────────
 printf "\n[gate] %d passed, %d failed\n" "$PASS_COUNT" "$FAIL_COUNT"
 if [ "$FAIL_COUNT" -ne 0 ]; then exit 1; fi
@@ -320,5 +371,5 @@ if [ "${RECORD_GOLDEN:-0}" = "1" ]; then
   printf "[gate] RECORD_GOLDEN: baselines written to %s/ (re-run without the env var to verify)\n" "$GOLDEN_DIR"
   exit 0
 fi
-printf "[gate] S1-S13 + 3 randomized seeds ALL PASS (golden mode, Zig-only)\n"
+printf "[gate] S1-S14 + 3 randomized seeds ALL PASS (golden mode, Zig-only)\n"
 printf "ALL PASS\n"

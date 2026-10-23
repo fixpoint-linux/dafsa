@@ -1,0 +1,34 @@
+= vopen 1
+= vlookup 1
+= vlookup 1
+= vlookup 1
+= vlookup 0
+= vlookup 0
+= vlookup 0
+= vlookup 0
+= vprefix 2
+
+63
+= vprefix 0
+= vprefix 0
+= vclose
+= create 1
+= load 1
+= stats 204 204 3 403 0
+= save 0
+= free 1
+= vopen 1
+= vlookup 1
+= vlookup 1
+= vlookup 1
+= vlookup 0
+= vlookup 0
+= vlookup 0
+= vlookup 0
+= vprefix 2
+
+63
+= vprefix 0
+= vprefix 0
+= vclose
+= free 1

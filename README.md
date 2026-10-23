@@ -49,9 +49,15 @@ bytes — a deliberate design requirement for the target use case.
 - Incremental `add` / `lookup` / `delete`.
 - Length-delimited key API (`dafsa_add_n`, `dafsa_lookup_n`, `dafsa_delete_n`)
   plus NUL-terminated convenience wrappers.
-- Persistence (`dafsa_save` / `dafsa_load`, PDWG v4 format, atomic rename +
+- Persistence (`dafsa_save` / `dafsa_load`, PDWG v5 format, atomic rename +
   fsync), prefix enumeration (`dafsa_prefix_enum`, `W\0` semantics), zero-copy
   mmap view (`dafsa_view_open`), WAL, CRC32.
+- **Format compatibility:** v5 adds an *optional* persisted `state_off` offset
+  table (header field 6 is a flags word; bit 0 says it is present).  The writer
+  emits it only when it is at most half the CSR it indexes, so a state-dense
+  file keeps the v4 byte layout.  Readers accept v3, v4 and v5 — a file without
+  the table is opened by rebuilding the offsets from the CSR — so every
+  existing file loads unchanged, and the next save upgrades it to v5.
 - Bulk minimal construction (`dafsa_build_sorted`) and rank / view_rank.
 - Statistics (`dafsa_stats`) and Graphviz DOT export (`dafsa_dot`).
 - Portably C99; builds with a system `cc` (`-D_POSIX_C_SOURCE=200809L`).

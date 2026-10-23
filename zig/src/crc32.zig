@@ -72,14 +72,46 @@ pub const table: [256]u32 = .{
     0xB40BBE37, 0xC30C8EA1, 0x5A05DF1B, 0x2D02EF8D,
 };
 
+// Slicing-by-8 tables, derived from `table` at comptime:
+//   slicing[n][i] = the register after feeding n zero bytes to slicing[n-1][i].
+// slicing[0] == table.  Used by compute() only; `update` stays byte-at-a-time
+// (it is the streaming API the put_* helpers fold one byte at a time, and the
+// reference the slicing path is tested against).
+const slicing: [8][256]u32 = blk: {
+    @setEvalBranchQuota(1_000_000);
+    var t: [8][256]u32 = undefined;
+    for (0..256) |i| t[0][i] = table[i];
+    for (1..8) |n| {
+        for (0..256) |i| {
+            const prev = t[n - 1][i];
+            t[n][i] = (prev >> 8) ^ table[prev & 0xFF];
+        }
+    }
+    break :blk t;
+};
+
 pub fn init() u32 {
     return 0xFFFFFFFF;
 }
 
+/// Fold `data` into the running register.  Slicing-by-8, so this is a
+/// continuation usable mid-stream (dafsaViewOpen folds the header/state-table
+/// prefix here and the CSR in chunks as its offset walk consumes it — one pass
+/// over the file instead of two).
 pub fn update(crc: u32, data: []const u8) u32 {
     var c = crc;
-    for (data) |b| {
-        c = table[(c ^ @as(u32, @intCast(b))) & 0xFF] ^ (c >> 8);
+    var i: usize = 0;
+    while (data.len - i >= 8) : (i += 8) {
+        const lo = std.mem.readInt(u32, data[i..][0..4], .little);
+        const hi = std.mem.readInt(u32, data[i + 4 ..][0..4], .little);
+        c ^= lo;
+        c = slicing[7][c & 0xFF] ^ slicing[6][(c >> 8) & 0xFF] ^
+            slicing[5][(c >> 16) & 0xFF] ^ slicing[4][(c >> 24) & 0xFF] ^
+            slicing[3][hi & 0xFF] ^ slicing[2][(hi >> 8) & 0xFF] ^
+            slicing[1][(hi >> 16) & 0xFF] ^ slicing[0][(hi >> 24) & 0xFF];
+    }
+    while (i < data.len) : (i += 1) {
+        c = table[(c ^ @as(u32, @intCast(data[i]))) & 0xFF] ^ (c >> 8);
     }
     return c;
 }
@@ -88,6 +120,90 @@ pub fn finalize(crc: u32) u32 {
     return crc ^ 0xFFFFFFFF;
 }
 
+/// Whole-buffer CRC32.  MEASURED: the byte-at-a-time loop runs at ~0.5 GB/s,
+/// which made the v4/v5 whole-file verification 40 ms of a 73 ms
+/// dafsa_view_open on a 20.7 MB store file.  Slicing-by-8 consumes 8 bytes per
+/// step through 8 independent tables — same polynomial, same register
+/// convention, so the VALUE is identical (asserted by the test below over every
+/// length 0..=2048 at every alignment, plus a 1 MiB buffer).
 pub fn compute(data: []const u8) u32 {
     return finalize(update(init(), data));
+}
+
+const testing = std.testing;
+
+/// Byte-at-a-time reference (the original implementation) the slicing path is
+/// tested against.
+fn referenceCrc(data: []const u8) u32 {
+    var c: u32 = init();
+    for (data) |b| c = table[(c ^ @as(u32, @intCast(b))) & 0xFF] ^ (c >> 8);
+    return finalize(c);
+}
+
+test "compute: known vector (\"123456789\")" {
+    try testing.expectEqual(@as(u32, 0xCBF43926), compute("123456789"));
+}
+
+test "compute: slicing-by-8 == byte-at-a-time reference, all lengths/alignments" {
+    var buf: [2048 + 16]u8 = undefined;
+    var seed: u64 = 0x9E3779B97F4A7C15;
+    for (&buf) |*b| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        b.* = @truncate(seed);
+    }
+    // Every length 0..=2048 (covers both the 8-byte bulk loop and every tail),
+    // at every start alignment.
+    var off: usize = 0;
+    while (off <= 8) : (off += 1) {
+        var len: usize = 0;
+        while (len <= 2048) : (len += 1) {
+            const data = buf[off .. off + len];
+            try testing.expectEqual(referenceCrc(data), compute(data));
+        }
+    }
+}
+
+test "update: chunked folding equals a single pass" {
+    // dafsaViewOpen folds the header/state-table prefix and then the CSR in
+    // chunks as its offset walk consumes them; the chunk boundaries must tile
+    // the file exactly.
+    const n = 1 << 16;
+    const data = try testing.allocator.alloc(u8, n);
+    defer testing.allocator.free(data);
+    var seed: u64 = 99;
+    for (data) |*b| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        b.* = @truncate(seed);
+    }
+    const whole = compute(data);
+    var cut: usize = 0;
+    while (cut <= n) : (cut += 977) {
+        var reg: u32 = init();
+        var off: usize = 0;
+        // fold in two ranges with an odd inner chunking
+        while (off < cut) : (off += 13) {
+            reg = update(reg, data[off..@min(off + 13, cut)]);
+        }
+        off = cut;
+        while (off < n) : (off += 4096) {
+            reg = update(reg, data[off..@min(off + 4096, n)]);
+        }
+        try testing.expectEqual(whole, finalize(reg));
+    }
+}
+
+test "compute: 1 MiB buffer matches the reference" {
+    const n = 1 << 20;
+    const data = try testing.allocator.alloc(u8, n);
+    defer testing.allocator.free(data);
+    var seed: u64 = 12345;
+    for (data) |*b| {
+        seed = seed *% 6364136223846793005 +% 1442695040888963407;
+        b.* = @truncate(seed >> 33);
+    }
+    try testing.expectEqual(referenceCrc(data), compute(data));
 }

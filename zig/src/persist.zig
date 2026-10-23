@@ -13,9 +13,27 @@ const Edge = internal.Edge;
 
 const linux = std.os.linux;
 
-// PDWG v4 magic and constants
+// PDWG magic and constants
 const PDWG_MAGIC = [_]u8{ 'P', 'D', 'W', 'G' };
-const PDWG_VERSION: u32 = 4;
+// v5 = v4 + an OPTIONAL persisted state_off table (header field 6, formerly
+// "reserved", is a flags word; bit 0 says the table is there).  Readers accept
+// v3, v4 and v5: a file without the table is opened exactly as before by
+// rebuilding the offsets from the CSR, so every existing file loads unchanged
+// and the next save upgrades it.
+const PDWG_VERSION: u32 = 5;
+/// header flags: a (n_states+2) x u64 LE state_off table sits between the final
+/// bitmap and the CSR, zero-padded to an 8-byte file offset.
+pub const PDWG_FLAG_STATE_OFF: u32 = 1;
+/// The writer persists the table only when it is at most 1/DEN of the CSR it
+/// indexes.  The reader has to verify the whole file's CRC32 either way, and
+/// the table's bytes join that checksum while the offset walk it replaces also
+/// costs a full pass — so the table only pays when it is small next to the CSR.
+/// MEASURED: on the agent store 13 of 30 files qualify — __postings__.dafsa
+/// 19.3 ms -> 13.2 ms open for +4.9 MB (+24%) — while a state-dense file like
+/// symbols.dafsa (12.9M states, 90 MB) stays table-less: its 103 MB table would
+/// more than double the file and make the open SLOWER (108 ms vs 88 ms).
+/// Store-wide the tables cost +3.8% (153.9 MB -> 159.7 MB).
+const STATE_OFF_TABLE_MAX_DEN: usize = 2; // table <= csr / DEN
 
 // Put helpers: append to ArrayList(u8) with streaming CRC32
 
@@ -206,28 +224,55 @@ pub fn dafsaSave(d: *const Dafsa, path: []const u8) i32 {
         }
     }
 
-    // Build the whole buffer.
+    // ── CSR: transitions grouped by state in state-table order (sym asc) ────
+    // Built into its own buffer FIRST: the optional v5 state_off table is
+    // emitted ahead of the CSR and its entries ARE the CSR byte offsets, so
+    // they must be known before the table is written.
+    var csr = std.ArrayList(u8).empty;
+    defer csr.deinit(allocator);
+    const state_off = allocator.alloc(u64, @as(usize, n_reach) + 2) catch return -1;
+    defer allocator.free(state_off);
+    state_off[0] = 0;
+    {
+        var i: u32 = 1;
+        while (i <= n_reach) : (i += 1) {
+            state_off[@intCast(i)] = csr.items.len;
+            const s = &d.states[queue[i - 1]];
+            const arr = internal.transArrC(s);
+            var j: u32 = 0;
+            while (j < s.ntrans) : (j += 1) {
+                put_u8(&csr, allocator, arr[j].sym, null);
+                put_uvarint(&csr, allocator, old_to_new[arr[j].target], null);
+            }
+        }
+        state_off[@as(usize, n_reach) + 1] = csr.items.len;
+    }
+    const with_table = (8 * state_off.len) * STATE_OFF_TABLE_MAX_DEN <= csr.items.len;
+
+    // Build the whole buffer.  The CRC is computed ONCE over the assembled
+    // buffer at the end (slice-by-8) rather than folded byte-at-a-time by each
+    // put_*: same value, and it keeps the save cost flat even when the table
+    // adds ~24% to the file.
     var list = std.ArrayList(u8).empty;
     defer list.deinit(allocator);
-    var crc: u32 = crc32.init();
 
     // header: magic 'PDWG'; u32 version; n_states; n_trans; initial_id=1;
-    // n_final; reserved=0
-    for (PDWG_MAGIC) |b| put_u8(&list, allocator, b, &crc);
-    put_u32_le(&list, allocator, PDWG_VERSION, &crc);
-    put_u32_le(&list, allocator, n_reach, &crc);
-    put_u32_le(&list, allocator, n_trans, &crc);
-    put_u32_le(&list, allocator, 1, &crc);
-    put_u32_le(&list, allocator, n_final, &crc);
-    put_u32_le(&list, allocator, 0, &crc);
+    // n_final; flags
+    for (PDWG_MAGIC) |b| put_u8(&list, allocator, b, null);
+    put_u32_le(&list, allocator, PDWG_VERSION, null);
+    put_u32_le(&list, allocator, n_reach, null);
+    put_u32_le(&list, allocator, n_trans, null);
+    put_u32_le(&list, allocator, 1, null);
+    put_u32_le(&list, allocator, n_final, null);
+    put_u32_le(&list, allocator, if (with_table) PDWG_FLAG_STATE_OFF else 0, null);
 
     // state table: (n_states+1) x u16 LE ntrans (entry 0 = 0)
-    put_u16_le(&list, allocator, 0, &crc);
+    put_u16_le(&list, allocator, 0, null);
     {
         var i: u32 = 1;
         while (i <= n_reach) : (i += 1) {
             const s = &d.states[queue[i - 1]];
-            put_u16_le(&list, allocator, @intCast(s.ntrans), &crc);
+            put_u16_le(&list, allocator, @intCast(s.ntrans), null);
         }
     }
 
@@ -243,26 +288,27 @@ pub fn dafsaSave(d: *const Dafsa, path: []const u8) i32 {
                 if (idx >= 1 and idx <= n_reach and d.states[queue[idx - 1]].is_final != 0)
                     byte |= @as(u8, 1) << @intCast(j);
             }
-            put_u8(&list, allocator, byte, &crc);
+            put_u8(&list, allocator, byte, null);
         }
     }
 
-    // CSR: transitions grouped by state in state-table order (sym asc)
-    {
-        var i: u32 = 1;
-        while (i <= n_reach) : (i += 1) {
-            const s = &d.states[queue[i - 1]];
-            const arr = internal.transArrC(s);
-            var j: u32 = 0;
-            while (j < s.ntrans) : (j += 1) {
-                put_u8(&list, allocator, arr[j].sym, &crc);
-                put_uvarint(&list, allocator, old_to_new[arr[j].target], &crc);
-            }
-        }
+    // v5 state_off table (optional, see with_table): (n_states+2) x u64 LE,
+    // zero-padded to an 8-byte file offset so a reader can index the mmap
+    // directly.  off[0]=0, off[i]=CSR start of state i, off[n+1]=CSR bytes —
+    // exactly what dafsa_view_open otherwise rebuilds by walking the CSR.
+    if (with_table) {
+        while (list.items.len % 8 != 0) put_u8(&list, allocator, 0, null);
+        const tbl = list.addManyAsSlice(allocator, 8 * state_off.len) catch return -1;
+        for (state_off, 0..) |v, idx|
+            std.mem.writeInt(u64, tbl[idx * 8 ..][0..8], v, .little);
     }
 
-    // v4: append the trailing CRC32 (finalized; the CRC field is NOT checksummed).
-    const final_crc = crc32.finalize(crc);
+    // CSR
+    list.appendSlice(allocator, csr.items) catch return -1;
+
+    // v4/v5: append the trailing CRC32 (finalized; the CRC field is NOT
+    // checksummed).
+    const final_crc = crc32.compute(list.items);
     put_u32_le(&list, allocator, final_crc, null);
 
     // atomic commit: write path.tmp, fsync, close, rename onto path.
@@ -375,15 +421,14 @@ pub fn dafsaLoadImpl(path: []const u8, mutable: bool) ?*Dafsa {
     var n_trans: u32 = undefined;
     var initial_id: u32 = undefined;
     var n_final: u32 = undefined;
-    var reserved: u32 = undefined;
+    var flags: u32 = undefined;
     if (!mb_get_u32_le(&cursor, &version)) return null;
     if (!mb_get_u32_le(&cursor, &n_states)) return null;
     if (!mb_get_u32_le(&cursor, &n_trans)) return null;
     if (!mb_get_u32_le(&cursor, &initial_id)) return null;
     if (!mb_get_u32_le(&cursor, &n_final)) return null;
-    if (!mb_get_u32_le(&cursor, &reserved)) return null;
-    _ = &reserved;
-    if (version != 3 and version != 4) return null;
+    if (!mb_get_u32_le(&cursor, &flags)) return null;
+    if (version < 3 or version > 5) return null;
     if (initial_id != 1) return null;
     if (n_states == 0) return null;
     if (n_states > internal.DAFSA_MAX_STATES_HARD) return null;
@@ -446,6 +491,19 @@ pub fn dafsaLoadImpl(path: []const u8, mutable: bool) ?*Dafsa {
     if (finals != n_final) return null;
     cursor = cursor[bitmap_bytes..];
 
+    // v5: skip the persisted state_off table — this loader materializes
+    // State[]/Edge[] and so recomputes every offset itself; the table exists
+    // for dafsa_view_open.  Layout: zero padding to an 8-byte file offset, then
+    // (n_states+2) x u64 LE.
+    if (version >= 5 and (flags & PDWG_FLAG_STATE_OFF) != 0) {
+        const pad = (8 - (buf.len - cursor.len) % 8) % 8;
+        if (cursor.len < pad) return null;
+        cursor = cursor[pad..];
+        const tbl_bytes = 8 * (@as(usize, n_states) + 2);
+        if (cursor.len < tbl_bytes) return null;
+        cursor = cursor[tbl_bytes..];
+    }
+
     // CSR: direct copy into trans[] (already sorted, no trans_add)
     {
         var i: u32 = 1;
@@ -466,9 +524,9 @@ pub fn dafsaLoadImpl(path: []const u8, mutable: bool) ?*Dafsa {
         }
     }
 
-    if (version == 4) {
-        // v4: verify trailing CRC32 over [buf, cursor).  Stored CRC is the last
-        // 4 bytes, little-endian.
+    if (version >= 4) {
+        // v4/v5: verify trailing CRC32 over [buf, cursor).  Stored CRC is the
+        // last 4 bytes, little-endian.
         if (fsize < 32) return null;
         if (cursor.len != 4) return null; // no trailing garbage after CRC
         const covered_len = buf.len - cursor.len;
@@ -566,7 +624,7 @@ test "put_uvarint / mb_get_uvarint roundtrip" {
     try roundtripUvarint(&[_]u32{ 0, 1, 127, 128, 255, 256, 300, 0x7F_FF_FF_FF });
 }
 
-test "golden vectors: PDWG v4 header fields" {
+test "golden vectors: PDWG v5 header fields" {
     var list = std.ArrayList(u8).empty;
     defer list.deinit(testing.allocator);
 
@@ -586,20 +644,20 @@ test "golden vectors: PDWG v4 header fields" {
     put_u32_le(&list, testing.allocator, 1, &crc);
     // n_final
     put_u32_le(&list, testing.allocator, 2, &crc);
-    // reserved
+    // flags (0 = no persisted state_off table)
     put_u32_le(&list, testing.allocator, 0, &crc);
 
     // Expected bytes (LE):
     // Magic: 'P','D','W','G' = [80, 68, 87, 71]
-    // Version: 4 LE = [4,0,0,0]
+    // Version: 5 LE = [5,0,0,0]
     // n_states: 3 LE = [3,0,0,0]
     // n_trans: 5 LE = [5,0,0,0]
     // initial_id: 1 LE = [1,0,0,0]
     // n_final: 2 LE = [2,0,0,0]
-    // reserved: 0 LE = [0,0,0,0]
+    // flags: 0 LE = [0,0,0,0]
     const expected = [_]u8{
         80, 68, 87, 71,
-        4, 0, 0, 0,
+        5, 0, 0, 0,
         3, 0, 0, 0,
         5, 0, 0, 0,
         1, 0, 0, 0,
@@ -684,4 +742,100 @@ test "CRC32 streaming matches compute" {
     const expected_crc = crc32.compute(list.items);
 
     try testing.expectEqual(expected_crc, final_crc);
+}
+
+test "v5 save/load round-trip: both loaders skip the persisted table" {
+    // A v5 file may carry a state_off table between the bitmap and the CSR.
+    // The loaders materialize State[]/Edge[] and recompute every offset, so
+    // they must skip it and still reproduce the exact language.
+    const allocator = testing.allocator;
+    var namebuf: [128]u8 = undefined;
+    const name = try std.fmt.bufPrint(&namebuf, "/tmp/dafsa_persist_test_{d}.pdwg", .{std.os.linux.getpid()});
+    const path = try allocator.dupeZ(u8, name);
+    defer allocator.free(path);
+    defer _ = std.os.linux.unlinkat(std.os.linux.AT.FDCWD, path, 0);
+
+    const d = dafsa_mod.dafsaCreate() orelse return error.OutOfMemory;
+    defer dafsa_mod.dafsaFree(d);
+    _ = core.dafsaAddN(d, "");
+    _ = core.dafsaAddN(d, "a\x00x");
+    // Wide automaton: 16 symbols x 3 levels with a per-symbol tail, so the CSR
+    // is large next to the state count and the writer persists the table.
+    var key: [32]u8 = undefined;
+    var a: u8 = 'a';
+    while (a <= 'p') : (a += 1) {
+        var b: u8 = 'a';
+        while (b <= 'p') : (b += 1) {
+            var c: u8 = 'a';
+            while (c <= 'p') : (c += 1) {
+                key[0] = a;
+                key[1] = b;
+                key[2] = c;
+                const tail: usize = a - 'a';
+                @memset(key[3 .. 3 + tail], 'd');
+                _ = core.dafsaAddN(d, key[0 .. 3 + tail]);
+            }
+        }
+    }
+    try testing.expectEqual(@as(i32, 0), dafsaSave(d, path));
+
+    // Layout: header, state table, bitmap, pad, (n+2) x u64 table, CSR, CRC.
+    const fd = try std.posix.openat(std.os.linux.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0);
+    var sb: std.os.linux.Statx = undefined;
+    const srx = std.os.linux.statx(fd, "", std.os.linux.AT.EMPTY_PATH, .BASIC_STATS, &sb);
+    try testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(srx));
+    const fsize: usize = @intCast(sb.size);
+    const head = try allocator.alloc(u8, fsize);
+    defer allocator.free(head);
+    var got: usize = 0;
+    while (got < fsize) {
+        const nr = try std.posix.read(fd, head[got..]);
+        if (nr == 0) break;
+        got += nr;
+    }
+    _ = std.os.linux.close(fd);
+    try testing.expectEqual(fsize, got);
+    try testing.expectEqualSlices(u8, "PDWG", head[0..4]);
+    try testing.expectEqual(PDWG_VERSION, std.mem.readInt(u32, head[4..8], .little));
+    const n_states = std.mem.readInt(u32, head[8..12], .little);
+    const n_trans = std.mem.readInt(u32, head[12..16], .little);
+    try testing.expectEqual(PDWG_FLAG_STATE_OFF, std.mem.readInt(u32, head[24..28], .little));
+    const pre_table = 28 + 2 * (@as(usize, n_states) + 1) + (@as(usize, n_states) + 8) / 8;
+    const tbl_off = pre_table + (8 - pre_table % 8) % 8;
+    try testing.expectEqual(@as(usize, 0), tbl_off % 8); // 8-aligned for u64 indexing
+    const tbl_bytes = 8 * (@as(usize, n_states) + 2);
+    // table[0] == 0, monotonic, table[n+1] == CSR length, and the CSR plus the
+    // trailer are exactly what is left in the file.
+    try testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, head[tbl_off..][0..8], .little));
+    var prev: u64 = 0;
+    var k: usize = 0;
+    while (k < @as(usize, n_states) + 2) : (k += 1) {
+        const off = std.mem.readInt(u64, head[tbl_off + k * 8 ..][0..8], .little);
+        try testing.expect(off >= prev);
+        prev = off;
+    }
+    const csr_len: usize = @intCast(prev);
+    try testing.expectEqual(fsize, tbl_off + tbl_bytes + csr_len + 4);
+    try testing.expect(csr_len >= 2 * @as(usize, n_trans));
+
+    const mutable = dafsaLoad(path) orelse return error.LoadFailed;
+    defer dafsa_mod.dafsaFree(mutable);
+    const ro = dafsaLoadReadonly(path) orelse return error.LoadFailed;
+    defer dafsa_mod.dafsaFree(ro);
+    try testing.expectEqual(@as(i32, 1), core.dafsaLookupN(mutable, "a\x00x"));
+    try testing.expectEqual(@as(i32, 1), core.dafsaLookupN(ro, "a\x00x"));
+    try testing.expectEqual(@as(i32, 0), core.dafsaLookupN(mutable, "a\x00y"));
+    a = 'a';
+    while (a <= 'p') : (a += 1) {
+        var b: u8 = 'a';
+        while (b <= 'p') : (b += 1) {
+            key[0] = a;
+            key[1] = b;
+            key[2] = 'a';
+            const tail: usize = a - 'a';
+            @memset(key[3 .. 3 + tail], 'd');
+            try testing.expectEqual(@as(i32, 1), core.dafsaLookupN(mutable, key[0 .. 3 + tail]));
+            try testing.expectEqual(@as(i32, 1), core.dafsaLookupN(ro, key[0 .. 3 + tail]));
+        }
+    }
 }

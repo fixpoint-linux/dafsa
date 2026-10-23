@@ -5,6 +5,15 @@
 // Includes the WAL overlay machinery (wal_overlay structs + overlay_* helpers,
 // nested upsert growth) and the layered open path (view_open_layered).
 //
+// Open needs state_off[] (n_states+2 byte offsets into the CSR) and, for a
+// v4/v5 file, the whole-file CRC32 verification.  Both are full scans, so they
+// are fused into ONE pass (buildStateOff), and a v5 file may also carry the
+// table itself so no scan is needed at all (PDWG_FLAG_STATE_OFF, persist.zig).
+// MEASURED on the agent store's 20,714,186-byte __postings__.dafsa (616,258
+// states): 75.8 ms before, 19.3 ms rebuilt, 13.2 ms from the persisted table;
+// on its 90,079,216-byte symbols.dafsa (12.9M states, table-less by design):
+// 294.9 ms -> 88 ms.
+//
 // I/O idioms (Zig 0.16, trimmed stdlib — see env-fact node
 // zig-0.16-sandbox-stdlib-facts):
 //   * open    = std.posix.openat(linux.AT.FDCWD, path_z, .{.ACCMODE=.RDONLY}, 0)
@@ -17,11 +26,15 @@
 //   * close   = std.os.linux.close(fd).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const internal = @import("internal.zig");
 const persist = @import("persist.zig");
 const crc32 = @import("crc32.zig");
 const state = @import("state.zig");
 const wal = @import("wal.zig");
+// test-only: build corpora to save/open (view.zig itself needs neither)
+const core = @import("core.zig");
+const dafsa_mod = @import("dafsa.zig");
 
 const Dafsa = internal.Dafsa;
 const State = internal.State;
@@ -335,6 +348,9 @@ pub const DafsaView = struct {
     final_bits: []const u8, // points into map (bitmap start)
     csr: []const u8, // points into map: first CSR byte
     state_off: []u64, // n_states+2 byte offsets into csr; off[0]=0; off[n_states+1]==total CSR bytes
+    // false => state_off ALIASES the mmap (the v5 persisted table): never write
+    // through it and never free it.  true => heap table rebuilt from the CSR.
+    state_off_owned: bool,
     ov: ?*WalOverlay, // WAL overlay for layered read, or null
 };
 
@@ -388,15 +404,14 @@ pub fn dafsaViewOpen(path: []const u8) ?*DafsaView {
     var n_trans: u32 = undefined;
     var initial_id: u32 = undefined;
     var n_final: u32 = undefined;
-    var reserved: u32 = undefined;
+    var flags: u32 = undefined;
     if (!persist.mb_get_u32_le(&p, &version)) return null;
     if (!persist.mb_get_u32_le(&p, &n_states)) return null;
     if (!persist.mb_get_u32_le(&p, &n_trans)) return null;
     if (!persist.mb_get_u32_le(&p, &initial_id)) return null;
     if (!persist.mb_get_u32_le(&p, &n_final)) return null;
-    if (!persist.mb_get_u32_le(&p, &reserved)) return null;
-    _ = &reserved;
-    if (version != 3 and version != 4) return null;
+    if (!persist.mb_get_u32_le(&p, &flags)) return null;
+    if (version < 3 or version > 5) return null;
     if (initial_id != 1) return null;
     if (n_states == 0) return null;
 
@@ -431,45 +446,82 @@ pub fn dafsaViewOpen(path: []const u8) ?*DafsaView {
     const final_bits: []const u8 = p[0..bitmap_bytes];
     p = p[bitmap_bytes..];
 
-    // build state_off: walk the CSR once, reading ntrans from ntbl.
-    if (@as(usize, n_states) + 2 > std.math.maxInt(usize) / @sizeOf(u64)) return null;
-    state_off = allocator.alloc(u64, @as(usize, n_states) + 2) catch return null;
-    @memset(state_off.?, 0);
-
-    {
-        // p now points at first CSR byte
-        var q = p;
-        var nt_sum: u64 = 0;
-        state_off.?[0] = 0;
-        var i: u32 = 1;
-        while (i <= n_states) : (i += 1) {
-            // ntbl points at table start; state i's u16 is at bytes 2*i, 2*i+1
-            const nt: u16 = @as(u16, @intCast(ntbl[@as(usize, i) * 2])) |
-                (@as(u16, @intCast(ntbl[@as(usize, i) * 2 + 1])) << 8);
-            nt_sum += nt;
-            state_off.?[@intCast(i)] = @intCast(q.ptr - p.ptr);
-            var j: u32 = 0;
-            while (j < nt) : (j += 1) {
-                if (q.len == 0) return null;
-                q = q[1..]; // sym byte
-                var tgt: u32 = undefined;
-                if (!persist.mb_get_uvarint(&q, &tgt)) return null;
-                if (tgt > n_states) return null; // bounds check
-            }
+    // ── state_off ─────────────────────────────────────────────────────────
+    //
+    // Two paths, and the writer decides which one a file uses:
+    //
+    //   * v5 with PDWG_FLAG_STATE_OFF: the offset table is persisted, 8-byte
+    //     aligned right before the CSR, so the open is mmap + point at it.
+    //     The writer emits it only when it is small next to the CSR it indexes
+    //     (see dafsaSave) — MEASURED: on the agent store's __postings__.dafsa
+    //     (20,714,186 bytes, 616,258 states, 31 bytes of CSR per state) the
+    //     table is 4.9 MB (+24%) and the open drops 19.3 ms -> 13.2 ms.
+    //   * everything else (v3/v4, or a v5 file the writer left table-less):
+    //     rebuilt by one sequential walk of the CSR.  The walk reads every CSR
+    //     byte anyway and the v4/v5 trailer CRC32 covers exactly those bytes,
+    //     so the two scans are FUSED — the walk folds the CSR into the CRC in
+    //     bulk chunks and only the header/state-table/bitmap prefix is hashed
+    //     separately (19.3 ms vs 22.7 ms for two separate passes on
+    //     __postings__.dafsa).  This is the only path that scales for a
+    //     state-dense file: on the store's 90 MB symbols.dafsa (12.9M states) a
+    //     103 MB table would be bigger than the CSR it indexes, so persisting
+    //     it would make the open SLOWER (108 ms vs 88 ms) and the file 114%
+    //     larger — which is why the writer only persists it when it pays.
+    var csr: []const u8 = p;
+    var persisted: ?[]u64 = null;
+    if (version >= 5 and (flags & persist.PDWG_FLAG_STATE_OFF) != 0) {
+        // zero padding up to the 8-byte-aligned table offset
+        const pad = (8 - (map_slice.len - p.len) % 8) % 8;
+        if (p.len < pad) return null;
+        p = p[pad..];
+        const tbl_entries = @as(usize, n_states) + 2;
+        if (tbl_entries > p.len / 8) return null;
+        const tbl_bytes = tbl_entries * @sizeOf(u64);
+        if (p.len < tbl_bytes + 4) return null; // table + CSR + trailing CRC
+        const csr_data_len = p.len - tbl_bytes - 4;
+        if (comptime builtin.cpu.arch.endian() == .little) {
+            // page-aligned mmap + 8-aligned file offset => the u64 slice is
+            // properly aligned; it ALIASES the mapping (read-only by contract).
+            const tbl_off = map_slice.len - p.len;
+            const aligned: []align(8) u8 = @alignCast(map_slice[tbl_off .. tbl_off + tbl_bytes]);
+            const tbl: []u64 = std.mem.bytesAsSlice(u64, aligned);
+            // The trailer CRC covers the table's bytes, so this pass is not an
+            // integrity check — it is a consistency check, so that a WRITER bug
+            // cannot become a silently wrong traversal.
+            if (!tableConsistent(tbl, ntbl, n_states, csr_data_len)) return null;
+            persisted = tbl;
         }
-        state_off.?[@as(usize, n_states) + 1] = @intCast(q.ptr - p.ptr);
-        if (nt_sum != n_trans) return null; // header n_trans mismatch
-        if (version == 4) {
-            // v4: verify trailing CRC32. Covered region is [map, q). Stored CRC
-            // sits in the final 4 bytes, little-endian.
+        // (big-endian host: the table is little-endian, so fall through to the
+        // walk below rather than misread it — correct, just not O(1).)
+        p = p[tbl_bytes..];
+        csr = p;
+    }
+
+    if (persisted) |_| {
+        if (version >= 4) {
             if (fsize < 32) return null; // header 28 + CRC 4
-            if (q.len != 4) return null; // no trailing garbage after CRC
-            const covered_len = fsize - 4;
-            const stored = mbGetU32LeAt(map_slice, fsize - 4);
-            const calc = crc32.compute(map_slice[0..covered_len]);
-            if (calc != stored) return null;
-        } else {
-            if (q.len != 0) return null; // v3: CSR must end exactly at EOF
+            if (crc32.compute(map_slice[0 .. fsize - 4]) != mbGetU32LeAt(map_slice, fsize - 4)) return null;
+        }
+    } else {
+        if (@as(usize, n_states) + 2 > std.math.maxInt(usize) / @sizeOf(u64)) return null;
+        var crc_reg: u32 = crc32.init();
+        if (version >= 4) {
+            if (fsize < 32) return null; // header 28 + CRC 4
+            // prefix: everything before the CSR region
+            crc_reg = crc32.update(crc_reg, map_slice[0 .. map_slice.len - csr.len]);
+        }
+        state_off = buildStateOff(
+            allocator,
+            csr,
+            ntbl,
+            n_states,
+            n_trans,
+            csrRegionLen(csr, version),
+            if (version >= 4) &crc_reg else null,
+        ) catch return null;
+        if (version >= 4) {
+            // The walk folded the CSR in; compare against the stored trailer.
+            if (crc32.finalize(crc_reg) != mbGetU32LeAt(map_slice, fsize - 4)) return null;
         }
     }
 
@@ -481,12 +533,124 @@ pub fn dafsaViewOpen(path: []const u8) ?*DafsaView {
         .n_states = n_states,
         .initial = initial_id,
         .final_bits = final_bits,
-        .csr = p,
-        .state_off = state_off.?,
+        .csr = csr,
+        .state_off = if (persisted) |t| t else state_off.?,
+        .state_off_owned = persisted == null,
         .ov = null, // no overlay for plain open
     };
     ok = true;
     return v.?;
+}
+
+/// CSR region length as it sits in the file: a v4 file keeps its 4-byte CRC
+/// trailer at the end of the region, a v3 file ends at EOF.
+fn csrRegionLen(region: []const u8, version: u32) usize {
+    return region.len - (if (version >= 4) @as(usize, 4) else 0);
+}
+
+/// Is the persisted v5 table consistent with the rest of the file?  The
+/// trailer CRC already covers the table's bytes (so rot is caught); this checks
+/// that the offsets can be INDEXED safely, so that a writer bug cannot become a
+/// silently wrong traversal — the failure mode state_off governs.  One
+/// sequential pass:
+///   * endpoints — off[0] == 0, off[n_states+1] == the CSR's byte length;
+///   * monotonicity — off[i] <= off[i+1] for every state;
+///   * lower bound — a state's slice holds >= 2 bytes per transition
+///     (a sym byte plus a >=1-byte varint), per the ntbl count.
+fn tableConsistent(tbl: []const u64, ntbl: []const u8, n_states: u32, csr_data_len: usize) bool {
+    const n = @as(usize, n_states) + 2;
+    if (tbl.len != n) return false;
+    if (tbl[0] != 0) return false;
+    if (tbl[n - 1] != csr_data_len) return false;
+    var i: usize = 1;
+    while (i <= n_states) : (i += 1) {
+        const start = tbl[i];
+        const end = tbl[i + 1];
+        if (end < start) return false;
+        if (end - start < 2 * @as(u64, ntAt(ntbl, i))) return false;
+    }
+    return true;
+}
+
+fn ntAt(ntbl: []const u8, i: usize) u16 {
+    return @as(u16, @intCast(ntbl[i * 2])) |
+        (@as(u16, @intCast(ntbl[i * 2 + 1])) << 8);
+}
+
+/// Rebuild state_off by walking the CSR once.  `csr` is the CSR region as it
+/// sits in the file (a v4 file keeps its 4-byte CRC trailer inside it;
+/// `csr_data_len` excludes that).  Returns an owned table, or an error on a
+/// malformed CSR.
+///
+/// The varints are SKIPPED, not decoded: the offsets need only their byte
+/// lengths, and every consumer bounds-checks the target it reads
+/// (viewTransFind / viewEdgeNext / view_rank), so decoding each value here
+/// bought no safety — only work.  The walk still validates the structure: each
+/// varint is well-formed (<= 5 bytes, the u32 LEB128 limit), the transitions
+/// accounted for equal the header's n_trans, and the CSR ends exactly where the
+/// format says it does.
+///
+/// When `crc` is non-null it is the running CRC32 register covering everything
+/// before the CSR; the walk folds the CSR bytes it consumes into it (in bulk
+/// chunks, so the folding is a slicing-by-8 continuation rather than a per-byte
+/// fold).  The caller finalizes and compares — that is the v4/v5 integrity
+/// check, paid inside the walk it already had to do.
+fn buildStateOff(
+    allocator: std.mem.Allocator,
+    csr: []const u8,
+    ntbl: []const u8,
+    n_states: u32,
+    n_trans: u32,
+    csr_data_len: usize,
+    crc: ?*u32,
+) ![]u64 {
+    const tbl = try allocator.alloc(u64, @as(usize, n_states) + 2);
+    errdefer allocator.free(tbl);
+    @memset(tbl, 0);
+
+    var q = csr;
+    var nt_sum: u64 = 0;
+    var folded: usize = 0;
+    var i: u32 = 1;
+    while (i <= n_states) : (i += 1) {
+        const nt = ntAt(ntbl, i);
+        nt_sum += nt;
+        tbl[@intCast(i)] = q.ptr - csr.ptr;
+        var j: u32 = 0;
+        while (j < nt) : (j += 1) {
+            if (q.len == 0) return error.MalformedCsr;
+            q = q[1..]; // sym byte
+            if (!skipUvarint(&q)) return error.MalformedCsr;
+        }
+        // Fold the bytes consumed so far in bulk (every 256 states, and for the
+        // last one below) — one slicing-by-8 call per chunk, not per transition.
+        if (crc != null and (i & 0xFF) == 0) {
+            const cur = q.ptr - csr.ptr;
+            crc.?.* = crc32.update(crc.?.*, csr[folded..cur]);
+            folded = cur;
+        }
+    }
+    const consumed = q.ptr - csr.ptr;
+    tbl[@as(usize, n_states) + 1] = consumed;
+    if (nt_sum != n_trans) return error.MalformedCsr; // header n_trans mismatch
+    if (consumed != csr_data_len) return error.MalformedCsr;
+    if (crc) |c| c.* = crc32.update(c.*, csr[folded..consumed]);
+    return tbl;
+}
+
+/// Skip one LEB128 u32 in place (up to 5 bytes).  Returns false on EOF or a
+/// varint longer than a u32 can be — the same limit persist.mb_get_uvarint
+/// enforces, so a malformed tail is still rejected.
+fn skipUvarint(cursor: *[]const u8) bool {
+    var len: u32 = 1;
+    while (true) {
+        if (cursor.*.len == 0) return false;
+        const b = cursor.*[0];
+        cursor.* = cursor.*[1..];
+        if ((b & 0x80) == 0) return true;
+        len += 1;
+        if (len > 5) return false;
+    }
 }
 
 fn mbGetU32LeAt(buf: []const u8, off: usize) u32 {
@@ -500,7 +664,9 @@ pub fn dafsaViewClose(v: ?*DafsaView) void {
     const vv = v orelse return;
     if (vv.ov) |ov| overlayFree(ov);
     std.posix.munmap(vv.map);
-    vv.allocator.free(vv.state_off);
+    // The persisted table aliases `map` (already unmapped above); only a
+    // rebuilt table is ours to free.
+    if (vv.state_off_owned) vv.allocator.free(vv.state_off);
     vv.allocator.destroy(vv);
 }
 
@@ -795,4 +961,367 @@ pub fn dafsaViewOpenLayered(fst_path: []const u8, wal_path: ?[]const u8) ?*Dafsa
     }
 
     return v;
+}
+
+// ─── Tests: state_off correctness (persisted table AND rebuilt) + integrity ──
+//
+// Two corpora, one on each side of the writer's "persist the offset table only
+// when it pays" threshold (table <= csr/2):
+//   * WIDE  — every <a><b><c> over a 16-symbol alphabet, each followed by a
+//             run of 'd' as long as <a>: 50 states, 545 transitions, ~30 CSR
+//             bytes per state => table persisted.
+//   * DENSE — 204 keys forming a 200-deep chain: ~6 CSR bytes per state =>
+//             no table (the state_off rebuild is cheaper than checksumming a
+//             table bigger than the CSR it indexes).
+
+const testing = std.testing;
+
+fn buildWideCorpus() ?*Dafsa {
+    const d = dafsa_mod.dafsaCreate() orelse return null;
+    _ = core.dafsaAddN(d, "");
+    var key: [32]u8 = undefined;
+    var a: u8 = 'a';
+    while (a <= 'p') : (a += 1) {
+        var b: u8 = 'a';
+        while (b <= 'p') : (b += 1) {
+            var c: u8 = 'a';
+            while (c <= 'p') : (c += 1) {
+                key[0] = a;
+                key[1] = b;
+                key[2] = c;
+                const tail: usize = a - 'a';
+                @memset(key[3 .. 3 + tail], 'd');
+                _ = core.dafsaAddN(d, key[0 .. 3 + tail]);
+            }
+        }
+    }
+    _ = core.dafsaAddN(d, "a\x00z");
+    return d;
+}
+
+fn buildDenseCorpus() ?*Dafsa {
+    const d = dafsa_mod.dafsaCreate() orelse return null;
+    _ = core.dafsaAddN(d, "");
+    var key: [MAX_WORD_LEN]u8 = undefined;
+    var i: u32 = 0;
+    while (i <= 200) : (i += 1) {
+        key[0] = 'a';
+        key[1] = @intCast(i);
+        @memset(key[2 .. 2 + i], 'b');
+        _ = core.dafsaAddN(d, key[0 .. 2 + i]);
+    }
+    _ = core.dafsaAddN(d, "a\x00");
+    _ = core.dafsaAddN(d, "a\x00c");
+    return d;
+}
+
+fn writeFileBytes(path: [:0]const u8, bytes: []const u8) !void {
+    const fd = try std.posix.openat(linux.AT.FDCWD, path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
+    var off: usize = 0;
+    while (off < bytes.len) {
+        const rc = linux.write(fd, bytes.ptr + off, bytes.len - off);
+        switch (linux.errno(rc)) {
+            .SUCCESS => off += rc,
+            .INTR => continue,
+            else => {
+                _ = linux.close(fd);
+                return error.WriteFailed;
+            },
+        }
+    }
+    _ = linux.close(fd);
+}
+
+fn readFileBytes(allocator: std.mem.Allocator, path: [:0]const u8) ![]u8 {
+    const fd = try std.posix.openat(linux.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0);
+    defer _ = linux.close(fd);
+    var sb: linux.Statx = undefined;
+    const srx = linux.statx(fd, "", linux.AT.EMPTY_PATH, .BASIC_STATS, &sb);
+    if (linux.errno(srx) != .SUCCESS) return error.StatFailed;
+    const buf = try allocator.alloc(u8, @intCast(sb.size));
+    errdefer allocator.free(buf);
+    var got: usize = 0;
+    while (got < buf.len) {
+        const nr = try std.posix.read(fd, buf[got..]);
+        if (nr == 0) break;
+        got += nr;
+    }
+    return buf[0..got];
+}
+
+fn testPath(allocator: std.mem.Allocator, name: []const u8) ![:0]u8 {
+    var buf: [128]u8 = undefined;
+    const s = try std.fmt.bufPrint(&buf, "/tmp/dafsa_view_test_{d}_{s}.pdwg", .{ linux.getpid(), name });
+    return allocator.dupeZ(u8, s);
+}
+
+/// File layout of a saved DAFSA, read independently of view.zig: header fields,
+/// the CSR start (skipping the optional persisted table), and the CSR length.
+const Layout = struct {
+    version: u32,
+    flags: u32,
+    n_states: u32,
+    n_trans: u32,
+    ntbl_off: usize = 28,
+    csr_off: usize,
+    csr_len: usize,
+};
+
+fn parseLayout(bytes: []const u8) !Layout {
+    if (bytes.len < 32 or !std.mem.eql(u8, bytes[0..4], "PDWG")) return error.NotPdwg;
+    const version = std.mem.readInt(u32, bytes[4..8], .little);
+    const n_states = std.mem.readInt(u32, bytes[8..12], .little);
+    const n_trans = std.mem.readInt(u32, bytes[12..16], .little);
+    const flags = std.mem.readInt(u32, bytes[24..28], .little);
+    var off = 28 + 2 * (@as(usize, n_states) + 1) + (@as(usize, n_states) + 8) / 8;
+    if (version >= 5 and (flags & persist.PDWG_FLAG_STATE_OFF) != 0) {
+        off += (8 - off % 8) % 8;
+        off += 8 * (@as(usize, n_states) + 2);
+    }
+    const trailer: usize = if (version >= 4) 4 else 0;
+    if (bytes.len < off + trailer) return error.Truncated;
+    return .{
+        .version = version,
+        .flags = flags,
+        .n_states = n_states,
+        .n_trans = n_trans,
+        .csr_off = off,
+        .csr_len = bytes.len - off - trailer,
+    };
+}
+
+/// Independent rebuild of state_off from the file bytes: same walk the engine
+/// does, but DECODING each varint (persist.mb_get_uvarint) instead of skipping
+/// it, so an off-by-one in the skip logic cannot agree with it by construction.
+fn independentStateOff(allocator: std.mem.Allocator, bytes: []const u8, l: Layout) ![]u64 {
+    const tbl = try allocator.alloc(u64, @as(usize, l.n_states) + 2);
+    errdefer allocator.free(tbl);
+    @memset(tbl, 0);
+    const ntbl = bytes[l.ntbl_off..];
+    var cur: []const u8 = bytes[l.csr_off .. l.csr_off + l.csr_len];
+    var total: u64 = 0;
+    var i: u32 = 1;
+    while (i <= l.n_states) : (i += 1) {
+        const nt = @as(u16, @intCast(ntbl[@as(usize, i) * 2])) |
+            (@as(u16, @intCast(ntbl[@as(usize, i) * 2 + 1])) << 8);
+        tbl[@intCast(i)] = cur.ptr - bytes[l.csr_off ..].ptr;
+        var j: u32 = 0;
+        while (j < nt) : (j += 1) {
+            if (cur.len == 0) return error.Truncated;
+            cur = cur[1..];
+            var tgt: u32 = undefined;
+            if (!persist.mb_get_uvarint(&cur, &tgt)) return error.Truncated;
+            if (tgt > l.n_states) return error.BadTarget;
+            total += 1;
+        }
+    }
+    tbl[@as(usize, l.n_states) + 1] = cur.ptr - bytes[l.csr_off ..].ptr;
+    if (total != l.n_trans) return error.BadCount;
+    return tbl;
+}
+
+/// Re-serialize a v5 file the way a pre-v5 writer wrote it: version=4, no
+/// flags, no pad/table, the same state table/bitmap/CSR, then a v4 trailer.
+fn stripToV4(allocator: std.mem.Allocator, v5: []const u8) ![]u8 {
+    const l = try parseLayout(v5);
+    if (l.version < 5) return error.NotV5;
+    const pre_table = 28 + 2 * (@as(usize, l.n_states) + 1) + (@as(usize, l.n_states) + 8) / 8;
+    const out = try allocator.alloc(u8, pre_table + l.csr_len + 4);
+    errdefer allocator.free(out);
+    @memcpy(out[0..pre_table], v5[0..pre_table]);
+    std.mem.writeInt(u32, out[4..8], 4, .little); // version
+    std.mem.writeInt(u32, out[24..28], 0, .little); // no flags
+    @memcpy(out[pre_table .. pre_table + l.csr_len], v5[l.csr_off .. l.csr_off + l.csr_len]);
+    const crc = crc32.compute(out[0 .. pre_table + l.csr_len]);
+    std.mem.writeInt(u32, out[pre_table + l.csr_len ..][0..4], crc, .little);
+    return out;
+}
+
+// Digest of an enumeration: FNV-1a over (len, payload) pairs, so two views
+// agree only if they produce the SAME payloads in the same order.
+const EnumDigest = struct {
+    count: i64 = 0, // filled by the enumerator's out-param, not by cb()
+    h: u64 = FNV_OFFSET,
+
+    fn cb(payload: []const u8, user: ?*anyopaque) i32 {
+        const self: *EnumDigest = @ptrCast(@alignCast(user.?));
+        self.h ^= payload.len;
+        self.h *%= FNV_PRIME;
+        for (payload) |b| {
+            self.h ^= b;
+            self.h *%= FNV_PRIME;
+        }
+        return 0;
+    }
+};
+
+fn digestAll(v: *const DafsaView) EnumDigest {
+    var dg: EnumDigest = .{};
+    var buf: [MAX_WORD_LEN]u8 = undefined;
+    _ = viewEnumDfs(v, v.initial, &buf, 0, EnumDigest.cb, &dg, &dg.count);
+    return dg;
+}
+
+/// Save `d`, then assert that the view's state_off equals an INDEPENDENT parse
+/// of the same bytes and that both the persisted-table path and the rebuilt
+/// path (the same content re-serialized as a pre-v5 file) answer identically.
+fn checkBothPaths(allocator: std.mem.Allocator, d: *Dafsa, name: []const u8, want_table: bool) !void {
+    const path = try testPath(allocator, name);
+    defer allocator.free(path);
+    defer _ = linux.unlinkat(linux.AT.FDCWD, path, 0);
+    try testing.expectEqual(@as(i32, 0), persist.dafsaSave(d, path));
+
+    const bytes = try readFileBytes(allocator, path);
+    defer allocator.free(bytes);
+    const l = try parseLayout(bytes);
+    try testing.expectEqual(@as(u32, 5), l.version);
+    try testing.expectEqual(@as(u32, if (want_table) persist.PDWG_FLAG_STATE_OFF else 0), l.flags);
+
+    const v = dafsaViewOpen(path) orelse return error.OpenFailed;
+    defer dafsaViewClose(v);
+    // The writer's threshold decides which path this file takes.
+    try testing.expectEqual(want_table, !v.state_off_owned);
+    if (want_table) {
+        // aliases the mapping, 8-aligned, no allocation
+        try testing.expect(@intFromPtr(v.state_off.ptr) >= @intFromPtr(v.map.ptr));
+        try testing.expect(@intFromPtr(v.state_off.ptr) < @intFromPtr(v.map.ptr) + v.map.len);
+        try testing.expect(@intFromPtr(v.state_off.ptr) % 8 == 0);
+    }
+
+    // The offsets must equal an independent walk of the same bytes.
+    const want = try independentStateOff(allocator, bytes, l);
+    defer allocator.free(want);
+    try testing.expectEqualSlices(u64, want, v.state_off);
+
+    // Same content as a pre-v5 file => the rebuild path; identical table.
+    const v4_bytes = try stripToV4(allocator, bytes);
+    defer allocator.free(v4_bytes);
+    const v4_path = try testPath(allocator, "stripped");
+    defer allocator.free(v4_path);
+    defer _ = linux.unlinkat(linux.AT.FDCWD, v4_path, 0);
+    try writeFileBytes(v4_path, v4_bytes);
+    const v4v = dafsaViewOpen(v4_path) orelse return error.OpenFailed;
+    defer dafsaViewClose(v4v);
+    try testing.expect(v4v.state_off_owned);
+    try testing.expectEqualSlices(u64, v.state_off, v4v.state_off);
+    const a = digestAll(v);
+    const b = digestAll(v4v);
+    try testing.expectEqual(a.count, b.count);
+    try testing.expectEqual(a.h, b.h);
+    try testing.expect(a.count > 0);
+
+    // Every key the DAFSA holds must be found identically through both.
+    var key: [MAX_WORD_LEN]u8 = undefined;
+    var i: u32 = 0;
+    while (i <= 200) : (i += 1) {
+        key[0] = 'a';
+        key[1] = @intCast(i);
+        @memset(key[2 .. 2 + i], 'b');
+        try testing.expectEqual(dafsaViewLookupN(v, key[0 .. 2 + i]), dafsaViewLookupN(v4v, key[0 .. 2 + i]));
+    }
+    try testing.expectEqual(@as(i32, 0), dafsaViewLookupN(v, "definitely-absent"));
+}
+
+test "state_off: persisted table (wide corpus) == independent parse == rebuilt" {
+    const allocator = testing.allocator;
+    const d = buildWideCorpus() orelse return error.OutOfMemory;
+    defer dafsa_mod.dafsaFree(d);
+    try checkBothPaths(allocator, d, "wide", true);
+}
+
+test "state_off: state-dense corpus gets no table and the rebuild matches" {
+    const allocator = testing.allocator;
+    const d = buildDenseCorpus() orelse return error.OutOfMemory;
+    defer dafsa_mod.dafsaFree(d);
+    try checkBothPaths(allocator, d, "dense", false);
+}
+
+test "integrity: a corrupt CSR byte is rejected by the fused CRC pass" {
+    const allocator = testing.allocator;
+    const d = buildWideCorpus() orelse return error.OutOfMemory;
+    defer dafsa_mod.dafsaFree(d);
+
+    const path = try testPath(allocator, "corrupt");
+    defer allocator.free(path);
+    defer _ = linux.unlinkat(linux.AT.FDCWD, path, 0);
+    try testing.expectEqual(@as(i32, 0), persist.dafsaSave(d, path));
+
+    const good = try readFileBytes(allocator, path);
+    defer allocator.free(good);
+    const l = try parseLayout(good);
+
+    // (a) table-bearing file, corrupt one CSR byte
+    {
+        const bad = try allocator.dupe(u8, good);
+        defer allocator.free(bad);
+        bad[l.csr_off + l.csr_len / 2] ^= 0x01;
+        try writeFileBytes(path, bad);
+        try testing.expect(dafsaViewOpen(path) == null);
+    }
+    // (b) table-bearing file, corrupt one byte of the persisted table
+    {
+        const bad = try allocator.dupe(u8, good);
+        defer allocator.free(bad);
+        const tbl_off = 28 + 2 * (@as(usize, l.n_states) + 1) + (@as(usize, l.n_states) + 8) / 8;
+        const aligned = tbl_off + (8 - tbl_off % 8) % 8;
+        bad[aligned + 8 * 3] ^= 0x01; // low byte of state 3's offset
+        try writeFileBytes(path, bad);
+        try testing.expect(dafsaViewOpen(path) == null);
+    }
+    // (c) the same corruption in a table-less (pre-v5) file: the walk folds the
+    //     CSR into the CRC, so it must be rejected there too.
+    {
+        const v4_bytes = try stripToV4(allocator, good);
+        defer allocator.free(v4_bytes);
+        const l4 = try parseLayout(v4_bytes);
+        v4_bytes[l4.csr_off + l4.csr_len / 2] ^= 0x01;
+        try writeFileBytes(path, v4_bytes);
+        try testing.expect(dafsaViewOpen(path) == null);
+    }
+    // (d) untouched file still opens
+    try writeFileBytes(path, good);
+    const v = dafsaViewOpen(path) orelse return error.OpenFailed;
+    dafsaViewClose(v);
+}
+
+test "degenerate: empty DAFSA and single-key DAFSA" {
+    const allocator = testing.allocator;
+    const cases = [_]struct { name: []const u8, key: ?[]const u8 }{
+        .{ .name = "empty", .key = null },
+        .{ .name = "single", .key = "k" },
+    };
+    for (cases) |c| {
+        const d = dafsa_mod.dafsaCreate() orelse return error.OutOfMemory;
+        defer dafsa_mod.dafsaFree(d);
+        if (c.key) |k| _ = core.dafsaAddN(d, k);
+
+        const path = try testPath(allocator, c.name);
+        defer allocator.free(path);
+        defer _ = linux.unlinkat(linux.AT.FDCWD, path, 0);
+        try testing.expectEqual(@as(i32, 0), persist.dafsaSave(d, path));
+
+        const bytes = try readFileBytes(allocator, path);
+        defer allocator.free(bytes);
+        const l = try parseLayout(bytes);
+        // tiny files are state-dense: no table, the rebuild is trivial
+        try testing.expectEqual(@as(u32, 0), l.flags);
+
+        const v = dafsaViewOpen(path) orelse return error.OpenFailed;
+        defer dafsaViewClose(v);
+        try testing.expect(v.state_off_owned);
+        try testing.expectEqual(@as(u64, l.csr_len), v.state_off[v.n_states + 1]);
+        const want = try independentStateOff(allocator, bytes, l);
+        defer allocator.free(want);
+        try testing.expectEqualSlices(u64, want, v.state_off);
+        if (c.key) |k| {
+            try testing.expectEqual(@as(i32, 1), dafsaViewLookupN(v, k));
+        }
+        try testing.expectEqual(@as(i32, 0), dafsaViewLookupN(v, "absent"));
+
+        // and through the mutable loader too
+        const loaded = persist.dafsaLoad(path) orelse return error.LoadFailed;
+        defer dafsa_mod.dafsaFree(loaded);
+        if (c.key) |k| try testing.expectEqual(@as(i32, 1), core.dafsaLookupN(loaded, k));
+        try testing.expectEqual(@as(i32, 0), core.dafsaLookupN(loaded, "absent"));
+    }
 }
